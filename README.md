@@ -1,7 +1,11 @@
-The **ON-OFF-DRL-main** repo contains ready implementation on the ORAN dataset for Resource Allocation. It provides a comparative analysis of two DRL algorithms (PPO and ACER).
+[1] The **ON-OFF-DRL-main** repo contains ready implementation on the ORAN dataset for Resource Allocation. It provides a performance analysis of two DRL algorithms (PPO and ACER).
 
 
-The **deep-rl-main** contains the implementation of several other learning algorithms to be implemented and contrasted.
+[2] The **deep-rl-main** contains the implementation of several other learning algorithms.
 
 
-Currently working on embedding the _DDPG algorithm_ from the latter to the former.
+[3] The **spinningup_in_pytorch-master** contains the implementation of several other learning algorithms.
+
+
+Currently working on embedding the _DDPG algorithm_ from [2] and _TD3 algorithm_ from [3] into repo [1].
+ 
