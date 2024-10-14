@@ -4,4 +4,4 @@ The **ON-OFF-DRL-main** repo contains ready implementation on the ORAN dataset f
 The **deep-rl-main** contains the implementation of several other learning algorithms to be implemented and contrasted.
 
 
-Currently working on embedding the _DDPG algorithm_
+Currently working on embedding the _DDPG algorithm_ from the latter to the former.
