@@ -1,425 +1,327 @@
-import argparse
-import random
-from collections import namedtuple
 from copy import deepcopy
-from typing import List, Tuple
-
-import gym
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from tqdm import tqdm
-from abc import ABC, abstractmethod
-from pathlib import Path
 import numpy as np
-import matplotlib.pyplot as plt
-from matplotlib import animation
+import torch
+from torch.optim import Adam
+import gym
+import time
+import spinup.algos.pytorch.ddpg.core as core
+from spinup.utils.logx import EpochLogger
 
-# For reproducibility
-torch.manual_seed(24)
-random.seed(24)
-# Device configuration
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-Experience = namedtuple("Experience", ["state", "action", "reward", "next_state", "done"])
-
-class Agent(ABC):
-    """A class that defines the basic interface for Deep RL agents (discrete)"""
-
-    @abstractmethod
-    def act(self, s: torch.Tensor) -> int:
-        """Selects an action for the given state
-
-        :param s: The state to select an action for
-        :type s: torch.Tensor
-        :raises NotImplementedError: Method must be implemented by concrete agent classes
-        :return: An action (discrete)
-        :rtype: int
-        """
-        raise NotImplementedError
-        
-class ContinuousActorCriticAgent(Agent):
-    """An actor-critic agent that acts on continuous action spaces
-
-    :param num_features: The number of features of the state vector
-    :type num_features: int
-    :param action_dim: The dimension of the action space (i.e. 1-D, 2-D, etc.)
-    :type action_dim: int
-    :param device: The device (GPU or CPU) to use
-    :type device: torch.device
+class ReplayBuffer:
+    """
+    A simple FIFO experience replay buffer for DDPG agents.
     """
 
-    def __init__(self, num_features: int, action_dim: int, device: torch.device) -> None:
-        # Architecture suggested in the paper "Continuous Control with Deep Reinforcement Learning"
-        # https://arxiv.org/pdf/1509.02971.pdf
-        self._pi = nn.Sequential(
-            # Hidden Layer 1
-            nn.Linear(in_features=num_features, out_features=400),
-            nn.ReLU(inplace=True),
-            # Hidden Layer 2
-            nn.Linear(in_features=400, out_features=300),
-            nn.ReLU(inplace=True),
-            # Output layer
-            nn.Linear(in_features=300, out_features=action_dim),
-            nn.Tanh(),
-        ).to(device)
+    def __init__(self, obs_dim, act_dim, size):
+        self.obs_buf = np.zeros(core.combined_shape(size, obs_dim), dtype=np.float32)
+        self.obs2_buf = np.zeros(core.combined_shape(size, obs_dim), dtype=np.float32)
+        self.act_buf = np.zeros(core.combined_shape(size, act_dim), dtype=np.float32)
+        self.rew_buf = np.zeros(size, dtype=np.float32)
+        self.done_buf = np.zeros(size, dtype=np.float32)
+        self.ptr, self.size, self.max_size = 0, 0, size
 
-        self._q = nn.Sequential(
-            # Hidden Layer 1
-            nn.Linear(in_features=num_features + action_dim, out_features=400),
-            nn.ReLU(inplace=True),
-            # Hidden Layer 2
-            nn.Linear(in_features=400, out_features=300),
-            nn.ReLU(inplace=True),
-            # Output layer
-            nn.Linear(in_features=300, out_features=1),
-        ).to(device)
+    def store(self, obs, act, rew, next_obs, done):
+        self.obs_buf[self.ptr] = obs
+        self.obs2_buf[self.ptr] = next_obs
+        self.act_buf[self.ptr] = act
+        self.rew_buf[self.ptr] = rew
+        self.done_buf[self.ptr] = done
+        self.ptr = (self.ptr+1) % self.max_size
+        self.size = min(self.size+1, self.max_size)
 
-        self._device = device
+    def sample_batch(self, batch_size=32):
+        idxs = np.random.randint(0, self.size, size=batch_size)
+        batch = dict(obs=self.obs_buf[idxs],
+                     obs2=self.obs2_buf[idxs],
+                     act=self.act_buf[idxs],
+                     rew=self.rew_buf[idxs],
+                     done=self.done_buf[idxs])
+        return {k: torch.as_tensor(v, dtype=torch.float32) for k,v in batch.items()}
 
-    @property
-    def pi(self) -> nn.Module:
-        """The policy function approximator
 
-        :return: The policy approximator as a PyTorch module
-        :rtype: nn.Module
-        """
-        return self._pi
 
-    @property
-    def q(self) -> nn.Module:
-        """The Q function approximator
+def ddpg(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0, 
+         steps_per_epoch=4000, epochs=100, replay_size=int(1e6), gamma=0.99, 
+         polyak=0.995, pi_lr=1e-3, q_lr=1e-3, batch_size=100, start_steps=10000, 
+         update_after=1000, update_every=50, act_noise=0.1, num_test_episodes=10, 
+         max_ep_len=1000, logger_kwargs=dict(), save_freq=1):
+    """
+    Deep Deterministic Policy Gradient (DDPG)
 
-        :return: The Q approximator as a PyTorch module
-        :rtype: nn.Module
-        """
-        return self._q
 
-    def act(self, s: torch.Tensor) -> torch.Tensor:
-        # We need `torch.no_grad()` because we are going to be returning a tensor
-        # as opposed to integers (like in the discrete agent) which means we need
-        # to make sure the tensor is not added to the computational graph
-        # This is not needed in the discrete case because we call `item()` which
-        # automatically returns an integer which isn't part of the graph
-        # We also always move the tensor to the cpu because acting in the Gym
-        # environments can't be done in the GPU
-        # Once again this is not needed when using `item()` (discrete) because
-        # the integer is returned already in the CPU
+    Args:
+        env_fn : A function which creates a copy of the environment.
+            The environment must satisfy the OpenAI Gym API.
+
+        actor_critic: The constructor method for a PyTorch Module with an ``act`` 
+            method, a ``pi`` module, and a ``q`` module. The ``act`` method and
+            ``pi`` module should accept batches of observations as inputs,
+            and ``q`` should accept a batch of observations and a batch of 
+            actions as inputs. When called, these should return:
+
+            ===========  ================  ======================================
+            Call         Output Shape      Description
+            ===========  ================  ======================================
+            ``act``      (batch, act_dim)  | Numpy array of actions for each 
+                                           | observation.
+            ``pi``       (batch, act_dim)  | Tensor containing actions from policy
+                                           | given observations.
+            ``q``        (batch,)          | Tensor containing the current estimate
+                                           | of Q* for the provided observations
+                                           | and actions. (Critical: make sure to
+                                           | flatten this!)
+            ===========  ================  ======================================
+
+        ac_kwargs (dict): Any kwargs appropriate for the ActorCritic object 
+            you provided to DDPG.
+
+        seed (int): Seed for random number generators.
+
+        steps_per_epoch (int): Number of steps of interaction (state-action pairs) 
+            for the agent and the environment in each epoch.
+
+        epochs (int): Number of epochs to run and train agent.
+
+        replay_size (int): Maximum length of replay buffer.
+
+        gamma (float): Discount factor. (Always between 0 and 1.)
+
+        polyak (float): Interpolation factor in polyak averaging for target 
+            networks. Target networks are updated towards main networks 
+            according to:
+
+            .. math:: \\theta_{\\text{targ}} \\leftarrow 
+                \\rho \\theta_{\\text{targ}} + (1-\\rho) \\theta
+
+            where :math:`\\rho` is polyak. (Always between 0 and 1, usually 
+            close to 1.)
+
+        pi_lr (float): Learning rate for policy.
+
+        q_lr (float): Learning rate for Q-networks.
+
+        batch_size (int): Minibatch size for SGD.
+
+        start_steps (int): Number of steps for uniform-random action selection,
+            before running real policy. Helps exploration.
+
+        update_after (int): Number of env interactions to collect before
+            starting to do gradient descent updates. Ensures replay buffer
+            is full enough for useful updates.
+
+        update_every (int): Number of env interactions that should elapse
+            between gradient descent updates. Note: Regardless of how long 
+            you wait between updates, the ratio of env steps to gradient steps 
+            is locked to 1.
+
+        act_noise (float): Stddev for Gaussian exploration noise added to 
+            policy at training time. (At test time, no noise is added.)
+
+        num_test_episodes (int): Number of episodes to test the deterministic
+            policy at the end of each epoch.
+
+        max_ep_len (int): Maximum length of trajectory / episode / rollout.
+
+        logger_kwargs (dict): Keyword args for EpochLogger.
+
+        save_freq (int): How often (in terms of gap between epochs) to save
+            the current policy and value function.
+
+    """
+
+    logger = EpochLogger(**logger_kwargs)
+    logger.save_config(locals())
+
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+    env, test_env = env_fn(), env_fn()
+    obs_dim = env.observation_space.shape
+    act_dim = env.action_space.shape[0]
+
+    # Action limit for clamping: critically, assumes all dimensions share the same bound!
+    act_limit = env.action_space.high[0]
+
+    # Create actor-critic module and target networks
+    ac = actor_critic(env.observation_space, env.action_space, **ac_kwargs)
+    ac_targ = deepcopy(ac)
+
+    # Freeze target networks with respect to optimizers (only update via polyak averaging)
+    for p in ac_targ.parameters():
+        p.requires_grad = False
+
+    # Experience buffer
+    replay_buffer = ReplayBuffer(obs_dim=obs_dim, act_dim=act_dim, size=replay_size)
+
+    # Count variables (protip: try to get a feel for how different size networks behave!)
+    var_counts = tuple(core.count_vars(module) for module in [ac.pi, ac.q])
+    logger.log('\nNumber of parameters: \t pi: %d, \t q: %d\n'%var_counts)
+
+    # Set up function for computing DDPG Q-loss
+    def compute_loss_q(data):
+        o, a, r, o2, d = data['obs'], data['act'], data['rew'], data['obs2'], data['done']
+
+        q = ac.q(o,a)
+
+        # Bellman backup for Q function
         with torch.no_grad():
-            return self._pi(s.to(self._device)).cpu()
+            q_pi_targ = ac_targ.q(o2, ac_targ.pi(o2))
+            backup = r + gamma * (1 - d) * q_pi_targ
 
+        # MSE loss against Bellman backup
+        loss_q = ((q - backup)**2).mean()
 
-def evaluate(env: gym.Env, agent: Agent, episodes: int, verbose: bool) -> None:
-    """Evaluates the agent by interacting with the environment and produces a plot of the rewards
+        # Useful info for logging
+        loss_info = dict(QVals=q.detach().numpy())
 
-    :param env: The environment to interact with
-    :type env: gym.Env
-    :param agent: The agent to evaluate
-    :type agent: Agent
-    :param episodes: The episodes to interact
-    :type episodes: int
-    :param verbose: Whether to run in verbose mode or not
-    :type verbose: bool
-    """
-    rewards = []
+        return loss_q, loss_info
 
-    for _ in tqdm(range(episodes), disable=not verbose):
-        s = env.reset()
-        done = False
-        reward = 0.0
+    # Set up function for computing DDPG pi loss
+    def compute_loss_pi(data):
+        o = data['obs']
+        q_pi = ac.q(o, ac.pi(o))
+        return -q_pi.mean()
 
-        while not done:
-            s = torch.from_numpy(s).float()
-            a = agent.act(s)
-            s_prime, r, done, _ = env.step(a)
-            reward += r
-            s = s_prime
+    # Set up optimizers for policy and q-function
+    pi_optimizer = Adam(ac.pi.parameters(), lr=pi_lr)
+    q_optimizer = Adam(ac.q.parameters(), lr=q_lr)
 
-        rewards.append(reward)
+    # Set up model saving
+    logger.setup_pytorch_saver(ac)
 
-    print(f"Mean reward over {episodes} episodes: {np.mean(rewards)}")
+    def update(data):
+        # First run one gradient descent step for Q.
+        q_optimizer.zero_grad()
+        loss_q, loss_info = compute_loss_q(data)
+        loss_q.backward()
+        q_optimizer.step()
 
+        # Freeze Q-network so you don't waste computational effort 
+        # computing gradients for it during the policy learning step.
+        for p in ac.q.parameters():
+            p.requires_grad = False
 
-def plot_rewards(rewards: List[float], title: str, output_dir: str, filename: str) -> None:
-    """Plots the given rewards per episode
+        # Next run one gradient descent step for pi.
+        pi_optimizer.zero_grad()
+        loss_pi = compute_loss_pi(data)
+        loss_pi.backward()
+        pi_optimizer.step()
 
-    :param rewards: The rewards to plots, assumed to be one per _episode_
-    :type rewards: List[float]
-    :param title: The title for the plot
-    :type title: str
-    :param output_dir: str
-    :type output_dir: The directry where the plot will be saved to (will be created if it doesn't exist)
-    :param filename: The filename for the plot without `.png`
-    :type filename: str
-    """
-    Path(f"./output/{output_dir}").mkdir(exist_ok=True)
-    plt.plot(rewards)
-    plt.title(title)
-    plt.xlabel("Episode")
-    plt.ylabel("Reward")
-    plt.savefig(f"./output/{output_dir}/{filename}.png")
+        # Unfreeze Q-network so you can optimize it at next DDPG step.
+        for p in ac.q.parameters():
+            p.requires_grad = True
 
+        # Record things
+        logger.store(LossQ=loss_q.item(), LossPi=loss_pi.item(), **loss_info)
 
-def render_interaction(env: gym.Env, agent: Agent, output_dir: str, filename: str) -> None:
-    """Renders an interaction producing a GIF file
+        # Finally, update target networks by polyak averaging.
+        with torch.no_grad():
+            for p, p_targ in zip(ac.parameters(), ac_targ.parameters()):
+                # NB: We use an in-place operations "mul_", "add_" to update target
+                # params, as opposed to "mul" and "add", which would make new tensors.
+                p_targ.data.mul_(polyak)
+                p_targ.data.add_((1 - polyak) * p.data)
 
-    Assumes `ffmpeg` has been installed in the system
+    def get_action(o, noise_scale):
+        a = ac.act(torch.as_tensor(o, dtype=torch.float32))
+        a += noise_scale * np.random.randn(act_dim)
+        return np.clip(a, -act_limit, act_limit)
 
-    :param env: The environment to interact with
-    :type env: gym.Env
-    :param agent: The agent that interacts with the environment
-    :type agent: Agent
-    :param output_dir: str
-    :type output_dir: The directry where the plot will be saved to (will be created if it doesn't exist)
-    :param filename: The name of the output file without `.gif`
-    :type filename: str
-    """
-    Path(f"./output/{output_dir}").mkdir(exist_ok=True)
+    def test_agent():
+        for j in range(num_test_episodes):
+            o, d, ep_ret, ep_len = test_env.reset(), False, 0, 0
+            while not(d or (ep_len == max_ep_len)):
+                # Take deterministic actions at test time (noise_scale=0)
+                o, r, d, _ = test_env.step(get_action(o, 0))
+                ep_ret += r
+                ep_len += 1
+            logger.store(TestEpRet=ep_ret, TestEpLen=ep_len)
 
-    frames = []
-    s = env.reset()
-    done = False
-    reward = 0.0
+    # Prepare for interaction with environment
+    total_steps = steps_per_epoch * epochs
+    start_time = time.time()
+    o, ep_ret, ep_len = env.reset(), 0, 0
 
-    while not done:
-        frames.append(env.render(mode="rgb_array"))
-
-        s = torch.from_numpy(s).float()
-        a = agent.act(s)
-        s_prime, r, done, _ = env.step(a)
-        reward += r
-        s = s_prime
-
-    env.close()
-    print(f"Total reward from interaction: {reward}")
-    _to_gif(frames, f"{output_dir}/{filename}")
-
-
-def _to_gif(frames: List[np.ndarray], filename: str, size: Tuple[int, int] = (72, 72), dpi: int = 72) -> None:
-    print(f"Generating GIF: {filename}.gif")
-    plt.figure(figsize=(frames[0].shape[1] / size[0], frames[0].shape[0] / size[1]), dpi=dpi)
-
-    patch = plt.imshow(frames[0])
-    plt.axis("off")
-
-    def animate(i):
-        patch.set_data(frames[i])
-
-    anim = animation.FuncAnimation(plt.gcf(), animate, frames=len(frames), interval=50)
-    anim.save(f"./output/{filename}.gif", writer="ffmpeg", fps=60)
-
-
-class Buffer:
-    """Experience replay buffer
-
-    :param capacity: The max capacity of the buffer
-    :type capacity: int
-    """
-
-    def __init__(self, capacity: int) -> None:
-        self._max_capacity = capacity
-        self._buf = []
-        self._capacity = 0
-
-    def save(self, experience: Experience) -> None:
-        """Saves the given experience to the buffer
-
-        When the max capacity is reached, an old experience is removed in a FIFO way.
-
-        :param experience: The experience to save
-        :type experience: Experience
-        """
-        if self._capacity == self._max_capacity:
-            self._buf.pop(0)
-            self._buf.append(experience)
+    # Main loop: collect experience in env and update/log each epoch
+    for t in range(total_steps):
+        
+        # Until start_steps have elapsed, randomly sample actions
+        # from a uniform distribution for better exploration. Afterwards, 
+        # use the learned policy (with some noise, via act_noise). 
+        if t > start_steps:
+            a = get_action(o, act_noise)
         else:
-            self._buf.append(experience)
-            self._capacity += 1
+            a = env.action_space.sample()
 
-    def get(self, batch_size: int) -> List[Experience]:
-        """Gets a random batch of experiences from the buffer
+        # Step the env
+        o2, r, d, _ = env.step(a)
+        ep_ret += r
+        ep_len += 1
 
-        :param batch_size: The size of the batch to get
-        :type batch_size: int
-        :return: A list of experiences
-        :rtype: List[Experience]
-        """
-        return random.choices(self._buf, k=batch_size)
+        # Ignore the "done" signal if it comes from hitting the time
+        # horizon (that is, when it's an artificial terminal signal
+        # that isn't based on the agent's state)
+        d = False if ep_len==max_ep_len else d
 
+        # Store experience to replay buffer
+        replay_buffer.store(o, a, r, o2, d)
 
-# pylint: disable=too-many-locals
-def ddpg(
-    env: gym.Env,
-    agent: ContinuousActorCriticAgent,
-    epochs: int,
-    max_steps: int,
-    buffer_capacity: int,
-    batch_size: int,
-    alpha: float,
-    gamma: float,
-    polyak: float,
-    act_noise: float,
-    verbose: bool,
-) -> List[float]:
-    """Trains an agent using Deep Deterministic Policy Gradients algorithm
+        # Super critical, easy to overlook step: make sure to update 
+        # most recent observation!
+        o = o2
 
-    :param env: The environment to train the agent in
-    :type env: gym.Env
-    :param agent: The agent to train
-    :type agent: ContinuousActorCriticAgent
-    :param epochs: The number of epochs to train the agent for
-    :type epochs: int
-    :param max_steps: The max number of steps per episode
-    :type max_steps: int
-    :param buffer_capacity: Max capacity of the experience replay buffer
-    :type buffer_capacity: int
-    :param batch_size: Batch size to use of experiences from the buffer
-    :type batch_size: int
-    :param gamma: The discount factor
-    :type gamma: float
-    :param alpha: The learning rate
-    :type alpha: float
-    :param polyak: Interpolation factor in polyak averaging for target networks
-    :type polyak: float
-    :param act_noise: Standard deviation for Gaussian exploration noise added to policy at training time
-    :type act_noise: float
-    :param verbose: Whether to run in verbose mode or not
-    :type verbose: bool
-    :return: The total reward per episode
-    :rtype: List[float]
-    """
-    pi_optimizer = optim.Adam(agent.pi.parameters(), lr=alpha)
-    q_optimizer = optim.Adam(agent.q.parameters(), lr=alpha)
-    target_pi = deepcopy(agent.pi).to(device)
-    target_q = deepcopy(agent.q).to(device)
-    experience_buf = Buffer(buffer_capacity)
-    total_rewards = []
+        # End of trajectory handling
+        if d or (ep_len == max_ep_len):
+            logger.store(EpRet=ep_ret, EpLen=ep_len)
+            o, ep_ret, ep_len = env.reset(), 0, 0
 
-    for _ in tqdm(range(epochs), disable=not verbose):
-        observation, _ = env.reset()  # Only take the observation part
-        s = torch.from_numpy(np.array(observation)).float()
-        done = False
-        reward = 0.0
-        steps = 0
+        # Update handling
+        if t >= update_after and t % update_every == 0:
+            for _ in range(update_every):
+                batch = replay_buffer.sample_batch(batch_size)
+                update(data=batch)
 
-        while not done and steps < max_steps:
-            # Collect and save experience from the environment
-            # Add Gaussian noise to the action for exploration
-            a = agent.act(s) + torch.normal(mean=0.0, std=act_noise, size=(1,))
-            a = a.item()
-            s_prime, r, done, _, _ = env.step(a)
-            s_prime = torch.from_numpy(s_prime).float()
+        # End of epoch handling
+        if (t+1) % steps_per_epoch == 0:
+            epoch = (t+1) // steps_per_epoch
 
-            reward += r
-            experience_buf.save(Experience(s, a, r, s_prime, done))
+            # Save model
+            if (epoch % save_freq == 0) or (epoch == epochs):
+                logger.save_state({'env': env}, None)
 
-            # Learn from previous experiences
-            experiences = experience_buf.get(batch_size)
-            loss = 0.0
+            # Test the performance of the deterministic version of the agent.
+            test_agent()
 
-            states = torch.stack([e.state for e in experiences]).to(device)
-            actions = torch.stack([e.action for e in experiences]).to(device)
-            rewards = [e.reward for e in experiences]
-            next_states = torch.stack([e.next_state for e in experiences]).to(device)
-            dones = [e.done for e in experiences]
+            # Log info about epoch
+            logger.log_tabular('Epoch', epoch)
+            logger.log_tabular('EpRet', with_min_and_max=True)
+            logger.log_tabular('TestEpRet', with_min_and_max=True)
+            logger.log_tabular('EpLen', average_only=True)
+            logger.log_tabular('TestEpLen', average_only=True)
+            logger.log_tabular('TotalEnvInteracts', t)
+            logger.log_tabular('QVals', with_min_and_max=True)
+            logger.log_tabular('LossPi', average_only=True)
+            logger.log_tabular('LossQ', average_only=True)
+            logger.log_tabular('Time', time.time()-start_time)
+            logger.dump_tabular()
 
-            q_values = agent.q(torch.cat([states, actions], dim=-1))
-            next_qvalues = target_q(torch.cat([next_states, target_pi(next_states)], dim=-1))
-            # Keep a copy of the current Q-values to be used for the TD targets
-            td_targets = q_values.clone()
-
-            # Compute TD targets
-            for index in range(batch_size):
-                # Terminal states do not have a future value
-                if dones[index]:
-                    next_qvalues[index] = 0.0
-
-                td_targets[index] = rewards[index] + gamma * next_qvalues[index]
-
-            # Compute TD error and loss (MSE)
-            loss = (td_targets - q_values) ** 2
-            loss = loss.mean()
-            # Update the value function
-            q_optimizer.zero_grad()
-            loss.sum().backward()
-            q_optimizer.step()
-
-            # Update the policy
-            # We use the negative loss because policy optimization is done using gradient _ascent_
-            # This is because in policy gradient methods, the "loss" is a performance measure that is _maximized_
-            loss = -agent.q(torch.cat([states, agent.pi(states)], dim=-1))
-            loss = loss.mean()
-            pi_optimizer.zero_grad()
-            loss.backward()
-            pi_optimizer.step()
-
-            # Update target networks with polyak averaging
-            with torch.no_grad():
-                for target_p, p in zip(target_pi.parameters(), agent.pi.parameters()):
-                    target_p.copy_(polyak * target_p + (1.0 - polyak) * p)
-
-            with torch.no_grad():
-                for target_p, p in zip(target_q.parameters(), agent.q.parameters()):
-                    target_p.copy_(polyak * target_p + (1.0 - polyak) * p)
-
-            s = s_prime
-            steps += 1
-
-        total_rewards.append(reward)
-
-    return total_rewards
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Execute Deep Deterministic Policy Gradients against Pendulum-v1 environment"
-    )
-    parser.add_argument("--epochs", type=int, default=200, help="Epochs to train")
-    parser.add_argument("--max-steps", type=int, default=1000, help="Max steps per episode")
-    parser.add_argument("--buf-capacity", type=int, default=50000, help="Max capacity of the experience replay buffer")
-    parser.add_argument("--batch-size", type=int, default=32, help="Batch size to use of experiences from the buffer")
-    parser.add_argument("--alpha", type=float, default=0.005, help="Learning rate")
-    parser.add_argument("--gamma", type=float, default=0.9, help="Discount factor")
-    parser.add_argument(
-        "--polyak", type=float, default=0.9, help="Interpolation factor in polyak averaging for target networks"
-    )
-    parser.add_argument(
-        "--act-noise", type=float, default=0.2, help="Standard deviation for Gaussian exploration noise"
-    )
-    parser.add_argument("--eval-episodes", type=int, default=100, help="Episodes to use for evaluation")
-    parser.add_argument("--verbose", action="store_true", help="Run in verbose mode")
-    parser.add_argument("--save-gif", action="store_true", help="Save a GIF of an interaction after training")
+if __name__ == '__main__':
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--env', type=str, default='HalfCheetah-v2')
+    parser.add_argument('--hid', type=int, default=256)
+    parser.add_argument('--l', type=int, default=2)
+    parser.add_argument('--gamma', type=float, default=0.99)
+    parser.add_argument('--seed', '-s', type=int, default=0)
+    parser.add_argument('--epochs', type=int, default=50)
+    parser.add_argument('--exp_name', type=str, default='ddpg')
     args = parser.parse_args()
 
-    agent = ContinuousActorCriticAgent(
-        num_features=3,
-        action_dim=1,
-        device=device,
-    )
-    env = gym.make("Pendulum-v1")
-    # For reproducibility
-    obs, info = env.reset(seed=24)
+    from spinup.utils.run_utils import setup_logger_kwargs
+    logger_kwargs = setup_logger_kwargs(args.exp_name, args.seed)
 
-    print(f"Training agent with the following args\n{args}")
-    rewards = ddpg(
-        env,
-        agent,
-        epochs=args.epochs,
-        max_steps=args.max_steps,
-        buffer_capacity=args.buf_capacity,
-        batch_size=args.batch_size,
-        alpha=args.alpha,
-        gamma=args.gamma,
-        polyak=args.polyak,
-        act_noise=args.act_noise,
-        verbose=args.verbose,
-    )
-
-    plot_rewards(rewards, title="DDPG on Pendulum-v1", output_dir="ddpg", filename="Pendulum-v1")
-
-    print("Evaluating agent")
-    evaluate(env, agent, args.eval_episodes, args.verbose)
-
-    if args.save_gif:
-        print("Rendering interaction")
-        render_interaction(env, agent, output_dir="ddpg", filename="Pendulum-v1")
+    ddpg(lambda : gym.make(args.env), actor_critic=core.MLPActorCritic,
+         ac_kwargs=dict(hidden_sizes=[args.hid]*args.l), 
+         gamma=args.gamma, seed=args.seed, epochs=args.epochs,
+         logger_kwargs=logger_kwargs)

@@ -1,0 +1,805 @@
+from copy import deepcopy
+import itertools
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.optim import Adam
+import gym
+import time
+import scipy.signal
+# logging data
+
+
+import json
+import joblib
+import shutil
+import numpy as np
+import tensorflow as tf
+import torch
+import os.path as osp, time, atexit, os
+import warnings
+from spinup.utils.mpi_tools import proc_id, mpi_statistics_scalar
+from spinup.utils.serialization_utils import convert_json
+
+color2num = dict(
+    gray=30,
+    red=31,
+    green=32,
+    yellow=33,
+    blue=34,
+    magenta=35,
+    cyan=36,
+    white=37,
+    crimson=38
+)
+
+def colorize(string, color, bold=False, highlight=False):
+    """
+    Colorize a string.
+
+    This function was originally written by John Schulman.
+    """
+    attr = []
+    num = color2num[color]
+    if highlight: num += 10
+    attr.append(str(num))
+    if bold: attr.append('1')
+    return '\x1b[%sm%s\x1b[0m' % (';'.join(attr), string)
+
+def restore_tf_graph(sess, fpath):
+    """
+    Loads graphs saved by Logger.
+
+    Will output a dictionary whose keys and values are from the 'inputs' 
+    and 'outputs' dict you specified with logger.setup_tf_saver().
+
+    Args:
+        sess: A Tensorflow session.
+        fpath: Filepath to save directory.
+
+    Returns:
+        A dictionary mapping from keys to tensors in the computation graph
+        loaded from ``fpath``. 
+    """
+    tf.saved_model.loader.load(
+                sess,
+                [tf.saved_model.tag_constants.SERVING],
+                fpath
+            )
+    model_info = joblib.load(osp.join(fpath, 'model_info.pkl'))
+    graph = tf.get_default_graph()
+    model = dict()
+    model.update({k: graph.get_tensor_by_name(v) for k,v in model_info['inputs'].items()})
+    model.update({k: graph.get_tensor_by_name(v) for k,v in model_info['outputs'].items()})
+    return model
+
+class Logger:
+    """
+    A general-purpose logger.
+
+    Makes it easy to save diagnostics, hyperparameter configurations, the 
+    state of a training run, and the trained model.
+    """
+
+    def __init__(self, output_dir=None, output_fname='progress.txt', exp_name=None):
+        """
+        Initialize a Logger.
+
+        Args:
+            output_dir (string): A directory for saving results to. If 
+                ``None``, defaults to a temp directory of the form
+                ``/tmp/experiments/somerandomnumber``.
+
+            output_fname (string): Name for the tab-separated-value file 
+                containing metrics logged throughout a training run. 
+                Defaults to ``progress.txt``. 
+
+            exp_name (string): Experiment name. If you run multiple training
+                runs and give them all the same ``exp_name``, the plotter
+                will know to group them. (Use case: if you run the same
+                hyperparameter configuration with multiple random seeds, you
+                should give them all the same ``exp_name``.)
+        """
+        if proc_id()==0:
+            self.output_dir = output_dir or "/tmp/experiments/%i"%int(time.time())
+            if osp.exists(self.output_dir):
+                print("Warning: Log dir %s already exists! Storing info there anyway."%self.output_dir)
+            else:
+                os.makedirs(self.output_dir)
+            self.output_file = open(osp.join(self.output_dir, output_fname), 'w')
+            atexit.register(self.output_file.close)
+            print(colorize("Logging data to %s"%self.output_file.name, 'green', bold=True))
+        else:
+            self.output_dir = None
+            self.output_file = None
+        self.first_row=True
+        self.log_headers = []
+        self.log_current_row = {}
+        self.exp_name = exp_name
+
+    def log(self, msg, color='green'):
+        """Print a colorized message to stdout."""
+        if proc_id()==0:
+            print(colorize(msg, color, bold=True))
+
+    def log_tabular(self, key, val):
+        """
+        Log a value of some diagnostic.
+
+        Call this only once for each diagnostic quantity, each iteration.
+        After using ``log_tabular`` to store values for each diagnostic,
+        make sure to call ``dump_tabular`` to write them out to file and
+        stdout (otherwise they will not get saved anywhere).
+        """
+        if self.first_row:
+            self.log_headers.append(key)
+        else:
+            assert key in self.log_headers, "Trying to introduce a new key %s that you didn't include in the first iteration"%key
+        assert key not in self.log_current_row, "You already set %s this iteration. Maybe you forgot to call dump_tabular()"%key
+        self.log_current_row[key] = val
+
+    def save_config(self, config):
+        """
+        Log an experiment configuration.
+
+        Call this once at the top of your experiment, passing in all important
+        config vars as a dict. This will serialize the config to JSON, while
+        handling anything which can't be serialized in a graceful way (writing
+        as informative a string as possible). 
+
+        Example use:
+
+        .. code-block:: python
+
+            logger = EpochLogger(**logger_kwargs)
+            logger.save_config(locals())
+        """
+        config_json = convert_json(config)
+        if self.exp_name is not None:
+            config_json['exp_name'] = self.exp_name
+        if proc_id()==0:
+            output = json.dumps(config_json, separators=(',',':\t'), indent=4, sort_keys=True)
+            print(colorize('Saving config:\n', color='cyan', bold=True))
+            print(output)
+            with open(osp.join(self.output_dir, "config.json"), 'w') as out:
+                out.write(output)
+
+    def save_state(self, state_dict, itr=None):
+        """
+        Saves the state of an experiment.
+
+        To be clear: this is about saving *state*, not logging diagnostics.
+        All diagnostic logging is separate from this function. This function
+        will save whatever is in ``state_dict``---usually just a copy of the
+        environment---and the most recent parameters for the model you 
+        previously set up saving for with ``setup_tf_saver``. 
+
+        Call with any frequency you prefer. If you only want to maintain a
+        single state and overwrite it at each call with the most recent 
+        version, leave ``itr=None``. If you want to keep all of the states you
+        save, provide unique (increasing) values for 'itr'.
+
+        Args:
+            state_dict (dict): Dictionary containing essential elements to
+                describe the current state of training.
+
+            itr: An int, or None. Current iteration of training.
+        """
+        if proc_id()==0:
+            fname = 'vars.pkl' if itr is None else 'vars%d.pkl'%itr
+            try:
+                joblib.dump(state_dict, osp.join(self.output_dir, fname))
+            except:
+                self.log('Warning: could not pickle state_dict.', color='red')
+            if hasattr(self, 'tf_saver_elements'):
+                self._tf_simple_save(itr)
+            if hasattr(self, 'pytorch_saver_elements'):
+                self._pytorch_simple_save(itr)
+
+    def setup_tf_saver(self, sess, inputs, outputs):
+        """
+        Set up easy model saving for tensorflow.
+
+        Call once, after defining your computation graph but before training.
+
+        Args:
+            sess: The Tensorflow session in which you train your computation
+                graph.
+
+            inputs (dict): A dictionary that maps from keys of your choice
+                to the tensorflow placeholders that serve as inputs to the 
+                computation graph. Make sure that *all* of the placeholders
+                needed for your outputs are included!
+
+            outputs (dict): A dictionary that maps from keys of your choice
+                to the outputs from your computation graph.
+        """
+        self.tf_saver_elements = dict(session=sess, inputs=inputs, outputs=outputs)
+        self.tf_saver_info = {'inputs': {k:v.name for k,v in inputs.items()},
+                              'outputs': {k:v.name for k,v in outputs.items()}}
+
+    def _tf_simple_save(self, itr=None):
+        """
+        Uses simple_save to save a trained model, plus info to make it easy
+        to associated tensors to variables after restore. 
+        """
+        if proc_id()==0:
+            assert hasattr(self, 'tf_saver_elements'), \
+                "First have to setup saving with self.setup_tf_saver"
+            fpath = 'tf1_save' + ('%d'%itr if itr is not None else '')
+            fpath = osp.join(self.output_dir, fpath)
+            if osp.exists(fpath):
+                # simple_save refuses to be useful if fpath already exists,
+                # so just delete fpath if it's there.
+                shutil.rmtree(fpath)
+            tf.saved_model.simple_save(export_dir=fpath, **self.tf_saver_elements)
+            joblib.dump(self.tf_saver_info, osp.join(fpath, 'model_info.pkl'))
+    
+
+    def setup_pytorch_saver(self, what_to_save):
+        """
+        Set up easy model saving for a single PyTorch model.
+
+        Because PyTorch saving and loading is especially painless, this is
+        very minimal; we just need references to whatever we would like to 
+        pickle. This is integrated into the logger because the logger
+        knows where the user would like to save information about this
+        training run.
+
+        Args:
+            what_to_save: Any PyTorch model or serializable object containing
+                PyTorch models.
+        """
+        self.pytorch_saver_elements = what_to_save
+
+    def _pytorch_simple_save(self, itr=None):
+        """
+        Saves the PyTorch model (or models).
+        """
+        if proc_id()==0:
+            assert hasattr(self, 'pytorch_saver_elements'), \
+                "First have to setup saving with self.setup_pytorch_saver"
+            fpath = 'pyt_save'
+            fpath = osp.join(self.output_dir, fpath)
+            fname = 'model' + ('%d'%itr if itr is not None else '') + '.pt'
+            fname = osp.join(fpath, fname)
+            os.makedirs(fpath, exist_ok=True)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                # We are using a non-recommended way of saving PyTorch models,
+                # by pickling whole objects (which are dependent on the exact
+                # directory structure at the time of saving) as opposed to
+                # just saving network weights. This works sufficiently well
+                # for the purposes of Spinning Up, but you may want to do 
+                # something different for your personal PyTorch project.
+                # We use a catch_warnings() context to avoid the warnings about
+                # not being able to save the source code.
+                torch.save(self.pytorch_saver_elements, fname)
+
+
+    def dump_tabular(self):
+        """
+        Write all of the diagnostics from the current iteration.
+
+        Writes both to stdout, and to the output file.
+        """
+        if proc_id()==0:
+            vals = []
+            key_lens = [len(key) for key in self.log_headers]
+            max_key_len = max(15,max(key_lens))
+            keystr = '%'+'%d'%max_key_len
+            fmt = "| " + keystr + "s | %15s |"
+            n_slashes = 22 + max_key_len
+            print("-"*n_slashes)
+            for key in self.log_headers:
+                val = self.log_current_row.get(key, "")
+                valstr = "%8.3g"%val if hasattr(val, "__float__") else val
+                print(fmt%(key, valstr))
+                vals.append(val)
+            print("-"*n_slashes, flush=True)
+            if self.output_file is not None:
+                if self.first_row:
+                    self.output_file.write("\t".join(self.log_headers)+"\n")
+                self.output_file.write("\t".join(map(str,vals))+"\n")
+                self.output_file.flush()
+        self.log_current_row.clear()
+        self.first_row=False
+
+class EpochLogger(Logger):
+    """
+    A variant of Logger tailored for tracking average values over epochs.
+
+    Typical use case: there is some quantity which is calculated many times
+    throughout an epoch, and at the end of the epoch, you would like to 
+    report the average / std / min / max value of that quantity.
+
+    With an EpochLogger, each time the quantity is calculated, you would
+    use 
+
+    .. code-block:: python
+
+        epoch_logger.store(NameOfQuantity=quantity_value)
+
+    to load it into the EpochLogger's state. Then at the end of the epoch, you 
+    would use 
+
+    .. code-block:: python
+
+        epoch_logger.log_tabular(NameOfQuantity, **options)
+
+    to record the desired values.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.epoch_dict = dict()
+
+    def store(self, **kwargs):
+        """
+        Save something into the epoch_logger's current state.
+
+        Provide an arbitrary number of keyword arguments with numerical 
+        values.
+        """
+        for k,v in kwargs.items():
+            if not(k in self.epoch_dict.keys()):
+                self.epoch_dict[k] = []
+            self.epoch_dict[k].append(v)
+
+    def log_tabular(self, key, val=None, with_min_and_max=False, average_only=False):
+        """
+        Log a value or possibly the mean/std/min/max values of a diagnostic.
+
+        Args:
+            key (string): The name of the diagnostic. If you are logging a
+                diagnostic whose state has previously been saved with 
+                ``store``, the key here has to match the key you used there.
+
+            val: A value for the diagnostic. If you have previously saved
+                values for this key via ``store``, do *not* provide a ``val``
+                here.
+
+            with_min_and_max (bool): If true, log min and max values of the 
+                diagnostic over the epoch.
+
+            average_only (bool): If true, do not log the standard deviation
+                of the diagnostic over the epoch.
+        """
+        if val is not None:
+            super().log_tabular(key,val)
+        else:
+            v = self.epoch_dict[key]
+            vals = np.concatenate(v) if isinstance(v[0], np.ndarray) and len(v[0].shape)>0 else v
+            stats = mpi_statistics_scalar(vals, with_min_and_max=with_min_and_max)
+            super().log_tabular(key if average_only else 'Average' + key, stats[0])
+            if not(average_only):
+                super().log_tabular('Std'+key, stats[1])
+            if with_min_and_max:
+                super().log_tabular('Max'+key, stats[3])
+                super().log_tabular('Min'+key, stats[2])
+        self.epoch_dict[key] = []
+
+    def get_stats(self, key):
+        """
+        Lets an algorithm ask the logger for mean/std/min/max of a diagnostic.
+        """
+        v = self.epoch_dict[key]
+        vals = np.concatenate(v) if isinstance(v[0], np.ndarray) and len(v[0].shape)>0 else v
+        return mpi_statistics_scalar(vals)
+    
+
+class ReplayBuffer:
+    """
+    A simple FIFO experience replay buffer for TD3 agents.
+    """
+
+    def __init__(self, obs_dim, act_dim, size):
+        self.obs_buf = np.zeros(core.combined_shape(size, obs_dim), dtype=np.float32)
+        self.obs2_buf = np.zeros(core.combined_shape(size, obs_dim), dtype=np.float32)
+        self.act_buf = np.zeros(core.combined_shape(size, act_dim), dtype=np.float32)
+        self.rew_buf = np.zeros(size, dtype=np.float32)
+        self.done_buf = np.zeros(size, dtype=np.float32)
+        self.ptr, self.size, self.max_size = 0, 0, size
+
+    def store(self, obs, act, rew, next_obs, done):
+        self.obs_buf[self.ptr] = obs
+        self.obs2_buf[self.ptr] = next_obs
+        self.act_buf[self.ptr] = act
+        self.rew_buf[self.ptr] = rew
+        self.done_buf[self.ptr] = done
+        self.ptr = (self.ptr+1) % self.max_size
+        self.size = min(self.size+1, self.max_size)
+
+    def sample_batch(self, batch_size=32):
+        idxs = np.random.randint(0, self.size, size=batch_size)
+        batch = dict(obs=self.obs_buf[idxs],
+                     obs2=self.obs2_buf[idxs],
+                     act=self.act_buf[idxs],
+                     rew=self.rew_buf[idxs],
+                     done=self.done_buf[idxs])
+        return {k: torch.as_tensor(v, dtype=torch.float32) for k,v in batch.items()}
+
+
+
+def td3(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0, 
+        steps_per_epoch=4000, epochs=100, replay_size=int(1e6), gamma=0.99, 
+        polyak=0.995, pi_lr=1e-3, q_lr=1e-3, batch_size=100, start_steps=10000, 
+        update_after=1000, update_every=50, act_noise=0.1, target_noise=0.2, 
+        noise_clip=0.5, policy_delay=2, num_test_episodes=10, max_ep_len=1000, 
+        logger_kwargs=dict(), save_freq=1):
+    """
+    Twin Delayed Deep Deterministic Policy Gradient (TD3)
+
+
+    Args:
+        env_fn : A function which creates a copy of the environment.
+            The environment must satisfy the OpenAI Gym API.
+
+        actor_critic: The constructor method for a PyTorch Module with an ``act`` 
+            method, a ``pi`` module, a ``q1`` module, and a ``q2`` module.
+            The ``act`` method and ``pi`` module should accept batches of 
+            observations as inputs, and ``q1`` and ``q2`` should accept a batch 
+            of observations and a batch of actions as inputs. When called, 
+            these should return:
+
+            ===========  ================  ======================================
+            Call         Output Shape      Description
+            ===========  ================  ======================================
+            ``act``      (batch, act_dim)  | Numpy array of actions for each 
+                                           | observation.
+            ``pi``       (batch, act_dim)  | Tensor containing actions from policy
+                                           | given observations.
+            ``q1``       (batch,)          | Tensor containing one current estimate
+                                           | of Q* for the provided observations
+                                           | and actions. (Critical: make sure to
+                                           | flatten this!)
+            ``q2``       (batch,)          | Tensor containing the other current 
+                                           | estimate of Q* for the provided observations
+                                           | and actions. (Critical: make sure to
+                                           | flatten this!)
+            ===========  ================  ======================================
+
+        ac_kwargs (dict): Any kwargs appropriate for the ActorCritic object 
+            you provided to TD3.
+
+        seed (int): Seed for random number generators.
+
+        steps_per_epoch (int): Number of steps of interaction (state-action pairs) 
+            for the agent and the environment in each epoch.
+
+        epochs (int): Number of epochs to run and train agent.
+
+        replay_size (int): Maximum length of replay buffer.
+
+        gamma (float): Discount factor. (Always between 0 and 1.)
+
+        polyak (float): Interpolation factor in polyak averaging for target 
+            networks. Target networks are updated towards main networks 
+            according to:
+
+            .. math:: \\theta_{\\text{targ}} \\leftarrow 
+                \\rho \\theta_{\\text{targ}} + (1-\\rho) \\theta
+
+            where :math:`\\rho` is polyak. (Always between 0 and 1, usually 
+            close to 1.)
+
+        pi_lr (float): Learning rate for policy.
+
+        q_lr (float): Learning rate for Q-networks.
+
+        batch_size (int): Minibatch size for SGD.
+
+        start_steps (int): Number of steps for uniform-random action selection,
+            before running real policy. Helps exploration.
+
+        update_after (int): Number of env interactions to collect before
+            starting to do gradient descent updates. Ensures replay buffer
+            is full enough for useful updates.
+
+        update_every (int): Number of env interactions that should elapse
+            between gradient descent updates. Note: Regardless of how long 
+            you wait between updates, the ratio of env steps to gradient steps 
+            is locked to 1.
+
+        act_noise (float): Stddev for Gaussian exploration noise added to 
+            policy at training time. (At test time, no noise is added.)
+
+        target_noise (float): Stddev for smoothing noise added to target 
+            policy.
+
+        noise_clip (float): Limit for absolute value of target policy 
+            smoothing noise.
+
+        policy_delay (int): Policy will only be updated once every 
+            policy_delay times for each update of the Q-networks.
+
+        num_test_episodes (int): Number of episodes to test the deterministic
+            policy at the end of each epoch.
+
+        max_ep_len (int): Maximum length of trajectory / episode / rollout.
+
+        logger_kwargs (dict): Keyword args for EpochLogger.
+
+        save_freq (int): How often (in terms of gap between epochs) to save
+            the current policy and value function.
+
+    """
+
+    logger = EpochLogger(**logger_kwargs)
+    logger.save_config(locals())
+
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+    env, test_env = env_fn(), env_fn()
+    obs_dim = env.observation_space.shape
+    act_dim = env.action_space.shape[0]
+
+    # Action limit for clamping: critically, assumes all dimensions share the same bound!
+    act_limit = env.action_space.high[0]
+
+    # Create actor-critic module and target networks
+    ac = actor_critic(env.observation_space, env.action_space, **ac_kwargs)
+    ac_targ = deepcopy(ac)
+
+    # Freeze target networks with respect to optimizers (only update via polyak averaging)
+    for p in ac_targ.parameters():
+        p.requires_grad = False
+        
+    # List of parameters for both Q-networks (save this for convenience)
+    q_params = itertools.chain(ac.q1.parameters(), ac.q2.parameters())
+
+    # Experience buffer
+    replay_buffer = ReplayBuffer(obs_dim=obs_dim, act_dim=act_dim, size=replay_size)
+
+    # Count variables (protip: try to get a feel for how different size networks behave!)
+    var_counts = tuple(core.count_vars(module) for module in [ac.pi, ac.q1, ac.q2])
+    logger.log('\nNumber of parameters: \t pi: %d, \t q1: %d, \t q2: %d\n'%var_counts)
+
+    # Set up function for computing TD3 Q-losses
+    def compute_loss_q(data):
+        o, a, r, o2, d = data['obs'], data['act'], data['rew'], data['obs2'], data['done']
+
+        q1 = ac.q1(o,a)
+        q2 = ac.q2(o,a)
+
+        # Bellman backup for Q functions
+        with torch.no_grad():
+            pi_targ = ac_targ.pi(o2)
+
+            # Target policy smoothing
+            epsilon = torch.randn_like(pi_targ) * target_noise
+            epsilon = torch.clamp(epsilon, -noise_clip, noise_clip)
+            a2 = pi_targ + epsilon
+            a2 = torch.clamp(a2, -act_limit, act_limit)
+
+            # Target Q-values
+            q1_pi_targ = ac_targ.q1(o2, a2)
+            q2_pi_targ = ac_targ.q2(o2, a2)
+            q_pi_targ = torch.min(q1_pi_targ, q2_pi_targ)
+            backup = r + gamma * (1 - d) * q_pi_targ
+
+        # MSE loss against Bellman backup
+        loss_q1 = ((q1 - backup)**2).mean()
+        loss_q2 = ((q2 - backup)**2).mean()
+        loss_q = loss_q1 + loss_q2
+
+        # Useful info for logging
+        loss_info = dict(Q1Vals=q1.detach().numpy(),
+                         Q2Vals=q2.detach().numpy())
+
+        return loss_q, loss_info
+
+    # Set up function for computing TD3 pi loss
+    def compute_loss_pi(data):
+        o = data['obs']
+        q1_pi = ac.q1(o, ac.pi(o))
+        return -q1_pi.mean()
+
+    # Set up optimizers for policy and q-function
+    pi_optimizer = Adam(ac.pi.parameters(), lr=pi_lr)
+    q_optimizer = Adam(q_params, lr=q_lr)
+
+    # Set up model saving
+    logger.setup_pytorch_saver(ac)
+
+    def update(data, timer):
+        # First run one gradient descent step for Q1 and Q2
+        q_optimizer.zero_grad()
+        loss_q, loss_info = compute_loss_q(data)
+        loss_q.backward()
+        q_optimizer.step()
+
+        # Record things
+        logger.store(LossQ=loss_q.item(), **loss_info)
+
+        # Possibly update pi and target networks
+        if timer % policy_delay == 0:
+
+            # Freeze Q-networks so you don't waste computational effort 
+            # computing gradients for them during the policy learning step.
+            for p in q_params:
+                p.requires_grad = False
+
+            # Next run one gradient descent step for pi.
+            pi_optimizer.zero_grad()
+            loss_pi = compute_loss_pi(data)
+            loss_pi.backward()
+            pi_optimizer.step()
+
+            # Unfreeze Q-networks so you can optimize it at next DDPG step.
+            for p in q_params:
+                p.requires_grad = True
+
+            # Record things
+            logger.store(LossPi=loss_pi.item())
+
+            # Finally, update target networks by polyak averaging.
+            with torch.no_grad():
+                for p, p_targ in zip(ac.parameters(), ac_targ.parameters()):
+                    # NB: We use an in-place operations "mul_", "add_" to update target
+                    # params, as opposed to "mul" and "add", which would make new tensors.
+                    p_targ.data.mul_(polyak)
+                    p_targ.data.add_((1 - polyak) * p.data)
+
+    def get_action(o, noise_scale):
+        a = ac.act(torch.as_tensor(o, dtype=torch.float32))
+        a += noise_scale * np.random.randn(act_dim)
+        return np.clip(a, -act_limit, act_limit)
+
+    def test_agent():
+        for j in range(num_test_episodes):
+            o, d, ep_ret, ep_len = test_env.reset(), False, 0, 0
+            while not(d or (ep_len == max_ep_len)):
+                # Take deterministic actions at test time (noise_scale=0)
+                o, r, d, _ = test_env.step(get_action(o, 0))
+                ep_ret += r
+                ep_len += 1
+            logger.store(TestEpRet=ep_ret, TestEpLen=ep_len)
+
+    # Prepare for interaction with environment
+    total_steps = steps_per_epoch * epochs
+    start_time = time.time()
+    o, ep_ret, ep_len = env.reset(), 0, 0
+
+    # Main loop: collect experience in env and update/log each epoch
+    for t in range(total_steps):
+        
+        # Until start_steps have elapsed, randomly sample actions
+        # from a uniform distribution for better exploration. Afterwards, 
+        # use the learned policy (with some noise, via act_noise). 
+        if t > start_steps:
+            a = get_action(o, act_noise)
+        else:
+            a = env.action_space.sample()
+
+        # Step the env
+        o2, r, d, _ = env.step(a)
+        ep_ret += r
+        ep_len += 1
+
+        # Ignore the "done" signal if it comes from hitting the time
+        # horizon (that is, when it's an artificial terminal signal
+        # that isn't based on the agent's state)
+        d = False if ep_len==max_ep_len else d
+
+        # Store experience to replay buffer
+        replay_buffer.store(o, a, r, o2, d)
+
+        # Super critical, easy to overlook step: make sure to update 
+        # most recent observation!
+        o = o2
+
+        # End of trajectory handling
+        if d or (ep_len == max_ep_len):
+            logger.store(EpRet=ep_ret, EpLen=ep_len)
+            o, ep_ret, ep_len = env.reset(), 0, 0
+
+        # Update handling
+        if t >= update_after and t % update_every == 0:
+            for j in range(update_every):
+                batch = replay_buffer.sample_batch(batch_size)
+                update(data=batch, timer=j)
+
+        # End of epoch handling
+        if (t+1) % steps_per_epoch == 0:
+            epoch = (t+1) // steps_per_epoch
+
+            # Save model
+            if (epoch % save_freq == 0) or (epoch == epochs):
+                logger.save_state({'env': env}, None)
+
+            # Test the performance of the deterministic version of the agent.
+            test_agent()
+
+            # Log info about epoch
+            logger.log_tabular('Epoch', epoch)
+            logger.log_tabular('EpRet', with_min_and_max=True)
+            logger.log_tabular('TestEpRet', with_min_and_max=True)
+            logger.log_tabular('EpLen', average_only=True)
+            logger.log_tabular('TestEpLen', average_only=True)
+            logger.log_tabular('TotalEnvInteracts', t)
+            logger.log_tabular('Q1Vals', with_min_and_max=True)
+            logger.log_tabular('Q2Vals', with_min_and_max=True)
+            logger.log_tabular('LossPi', average_only=True)
+            logger.log_tabular('LossQ', average_only=True)
+            logger.log_tabular('Time', time.time()-start_time)
+            logger.dump_tabular()
+
+if __name__ == '__main__':
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--env', type=str, default='HalfCheetah-v2')
+    parser.add_argument('--hid', type=int, default=256)
+    parser.add_argument('--l', type=int, default=2)
+    parser.add_argument('--gamma', type=float, default=0.99)
+    parser.add_argument('--seed', '-s', type=int, default=0)
+    parser.add_argument('--epochs', type=int, default=50)
+    parser.add_argument('--exp_name', type=str, default='td3')
+    args = parser.parse_args()
+
+    from spinup.utils.run_utils import setup_logger_kwargs
+    logger_kwargs = setup_logger_kwargs(args.exp_name, args.seed)
+
+    td3(lambda : gym.make(args.env), actor_critic=core.MLPActorCritic,
+        ac_kwargs=dict(hidden_sizes=[args.hid]*args.l), 
+        gamma=args.gamma, seed=args.seed, epochs=args.epochs,
+        logger_kwargs=logger_kwargs)
+
+
+
+def combined_shape(length, shape=None):
+    if shape is None:
+        return (length,)
+    return (length, shape) if np.isscalar(shape) else (length, *shape)
+
+def mlp(sizes, activation, output_activation=nn.Identity):
+    layers = []
+    for j in range(len(sizes)-1):
+        act = activation if j < len(sizes)-2 else output_activation
+        layers += [nn.Linear(sizes[j], sizes[j+1]), act()]
+    return nn.Sequential(*layers)
+
+def count_vars(module):
+    return sum([np.prod(p.shape) for p in module.parameters()])
+
+class MLPActor(nn.Module):
+
+    def __init__(self, obs_dim, act_dim, hidden_sizes, activation, act_limit):
+        super().__init__()
+        pi_sizes = [obs_dim] + list(hidden_sizes) + [act_dim]
+        self.pi = mlp(pi_sizes, activation, nn.Tanh)
+        self.act_limit = act_limit
+
+    def forward(self, obs):
+        # Return output from network scaled to action space limits.
+        return self.act_limit * self.pi(obs)
+
+class MLPQFunction(nn.Module):
+
+    def __init__(self, obs_dim, act_dim, hidden_sizes, activation):
+        super().__init__()
+        self.q = mlp([obs_dim + act_dim] + list(hidden_sizes) + [1], activation)
+
+    def forward(self, obs, act):
+        q = self.q(torch.cat([obs, act], dim=-1))
+        return torch.squeeze(q, -1) # Critical to ensure q has right shape.
+
+class MLPActorCritic(nn.Module):
+
+    def __init__(self, observation_space, action_space, hidden_sizes=(256,256),
+                 activation=nn.ReLU):
+        super().__init__()
+
+        obs_dim = observation_space.shape[0]
+        act_dim = action_space.shape[0]
+        act_limit = action_space.high[0]
+
+        # build policy and value functions
+        self.pi = MLPActor(obs_dim, act_dim, hidden_sizes, activation, act_limit)
+        self.q1 = MLPQFunction(obs_dim, act_dim, hidden_sizes, activation)
+        self.q2 = MLPQFunction(obs_dim, act_dim, hidden_sizes, activation)
+
+    def act(self, obs):
+        with torch.no_grad():
+            return self.pi(obs).numpy()
