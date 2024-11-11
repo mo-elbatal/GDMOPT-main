@@ -135,31 +135,31 @@ def step_plot():
         # smooth out rewards to get a smooth or a less smooth (var) plot lines
         run['reward_var_' + str(i)] = run['reward'].rolling(window=window_len_var, win_type='triang', min_periods=min_window_len_var).mean()
         # plot the lines
-        run.plot(kind='line', x='timestep' , y='reward_var_' + str(i),ax=ax,color='blue',  linewidth=linewidth_var, alpha=alpha_var, marker ='^',markevery=10)
+        run.plot(kind='line', x='timestep' , y='reward_var_' + str(i),ax=ax,color='blue',  linewidth=linewidth_var, alpha=alpha_var, marker ='*',markevery=10)
     print("============================================================================================")
 
     ax.grid(color='gray', linestyle='-', linewidth=1, alpha=0.2)
     ax.set_xlabel("Timesteps", fontsize=12)
     ax.set_ylabel("Reward", fontsize=12)
     ax.legend(['ACER','PPO', 'TD3'], fontsize=11, loc='lower right')
-    plt.annotate('ACER convergence point', xy =(18500, -2.21),
-             xytext =(20395, -2.8),bbox = dict(boxstyle ="round", fc ="0.8"),
-                arrowprops = dict(
-                    arrowstyle = "->",
-                    connectionstyle = "angle, angleA = 0, angleB = 90,\
-                        rad = 100"),)
-    plt.annotate('PPO convergence point', xy =(22147, -1.891),
-             xytext =(3000, -1.75),bbox = dict(boxstyle ="round", fc ="0.8"),
-                arrowprops = dict(
-                    arrowstyle = "->",
-                    connectionstyle = "angle, angleA = 0, angleB = 120,\
-                        rad = 10"),)
-    plt.annotate('TD3 convergence point', xy =(22147, -1.891),
-            xytext =(3000, -1.75),bbox = dict(boxstyle ="round", fc ="0.8"),
-            arrowprops = dict(
-                arrowstyle = "->",
-                connectionstyle = "angle, angleA = 0, angleB = 120,\
-                    rad = 10"),)
+    # plt.annotate('ACER convergence point', xy =(18500, -2.21),
+    #          xytext =(20395, -2.8),bbox = dict(boxstyle ="round", fc ="0.8"),
+    #             arrowprops = dict(
+    #                 arrowstyle = "->",
+    #                 connectionstyle = "angle, angleA = 0, angleB = 90,\
+    #                     rad = 100"),)
+    # plt.annotate('PPO convergence point', xy =(22147, -1.891),
+    #          xytext =(3000, -1.75),bbox = dict(boxstyle ="round", fc ="0.8"),
+    #             arrowprops = dict(
+    #                 arrowstyle = "->",
+    #                 connectionstyle = "angle, angleA = 0, angleB = 120,\
+    #                     rad = 10"),)
+    # plt.annotate('TD3 convergence point', xy =(22147, -1.891),
+    #         xytext =(3000, -1.75),bbox = dict(boxstyle ="round", fc ="0.8"),
+    #         arrowprops = dict(
+    #             arrowstyle = "->",
+    #             connectionstyle = "angle, angleA = 0, angleB = 120,\
+    #                 rad = 10"),)
     fig = plt.gcf()
     fig.tight_layout()
     plt.savefig(fig_save_path, dpi=600, facecolor='w', edgecolor='b',

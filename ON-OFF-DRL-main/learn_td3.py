@@ -61,36 +61,25 @@ class RolloutBuffer:
 class ActorCritic(nn.Module):
     def __init__(self, state_dim, action_dim, action_std_init):
         super(ActorCritic, self).__init__()
-        
-        # actor
-        self.actor = nn.Sequential(
-            nn.Linear(state_dim, 64),
-            nn.Tanh(),
-            nn.Linear(64, 64),
-            nn.Tanh(),
-            nn.Linear(64, action_dim),
-            nn.Softmax(dim=-1)
-            )
 
+        self.actor = nn.Sequential(
+            nn.Linear(state_dim, 256),
+            nn.Tanh(),
+            nn.Linear(256, 256),
+            nn.Softmax(dim=1)
+        )
         
-        # critic
         self.critic1 = nn.Sequential(
-                        nn.Linear(state_dim, 64),
-                        nn.Tanh(),
-                        nn.Linear(64, 64),
-                        nn.Tanh(),
-                        nn.Linear(64, 1)
-                    )
+            nn.Linear(state_dim, 256),
+            nn.Tanh(),
+            nn.Linear(256, action_dim)
+        )
         
-        #critic2
         self.critic2 = nn.Sequential(
-                        nn.Linear(state_dim, 64),
-                        nn.Tanh(),
-                        nn.Linear(64, 64),
-                        nn.Tanh(),
-                        nn.Linear(64, 1)
-                    )
-    
+            nn.Linear(state_dim, 256),
+            nn.Tanh(),
+            nn.Linear(256, action_dim)
+        )
 
     def act(self, state):
 
@@ -126,9 +115,10 @@ class TD3:
         self.policy = ActorCritic(state_dim, action_dim, action_std_init).to(device)
         self.optimizer = torch.optim.Adam([
                         {'params': self.policy.actor.parameters(), 'lr': lr_actor},
-                        {'params': self.policy.critic.parameters(), 'lr': lr_critic}
+                        {'params': self.policy.critic1.parameters(), 'lr': lr_critic}, 
+                        {'params': self.policy.critic2.parameters(), 'lr': lr_critic}
                     ])
-        
+                
         # Freeze target networks with respect to optimizers (only update via polyak averaging)
         for p in self.policy.parameters():
             p.requires_grad = False
@@ -147,7 +137,7 @@ class TD3:
             state = torch.FloatTensor(state).to(device)
             action, action_logprob = self.policy_old.act(state)
             
-        self.buffer.states.append(state)
+        self.buffer.states1.append(state)
         self.buffer.actions.append(action)
         self.buffer.logprobs.append(action_logprob)
 
@@ -167,7 +157,7 @@ class TD3:
             epsilon = torch.randn_like(pi_targ) * target_noise
             epsilon = torch.clamp(epsilon, -noise_clip, noise_clip)
             a2 = pi_targ + epsilon
-            a2 = torch.clamp(a2, -act_limit, act_limit)
+            a2 = torch.clamp(a2, 0, act_limit)
 
             # Target Q-values
             q1_pi_targ = self.policy.critic1(o2, a2)
@@ -192,13 +182,6 @@ class TD3:
         o = data['obs']
         q1_pi = self.policy.critic1(o, self.actor(o))
         return -q1_pi.mean()
-
-
-    # Set up optimizers for policy and q-function
-    def setup_optimizers(self):
-        pi_optimizer = torch.optim.Adam(self.policy.actor.parameters(), lr=lr_actor)
-        q_optimizer = torch.optim.Adam(self.q_params, lr=lr_critic)
-    setup_optimizers()
     
     def update(self, data, timer):
         # First run one gradient descent step for Q1 and Q2
@@ -251,7 +234,6 @@ class TD3:
         self.policy.load_state_dict(torch.load(checkpoint_path, map_location=lambda storage, loc: storage))
         
 ################################# End of Part I ################################
-
 print("============================================================================================")
 random_seed = 0         # set random seed
 torch.manual_seed(random_seed)
@@ -290,8 +272,7 @@ state_dim = args.n_servers * args.n_resources + args.n_resources + 1
 action_dim = args.n_servers
 
 # Action limit for clamping: critically, assumes all dimensions share the same bound!
-act_limit = env.action_space.high[0]
-
+act_limit = args.n_servers
 
 # initialize a PPO agent
 td3_agent = TD3(state_dim, action_dim, lr_actor, lr_critic, gamma, K_epochs, eps_clip, action_std)
@@ -299,7 +280,7 @@ td3_agent = TD3(state_dim, action_dim, lr_actor, lr_critic, gamma, K_epochs, eps
 random_seed = 0             #### set this to load a particular checkpoint trained on random seed
 run_num_pretrained = 0      #### set this to load a particular checkpoint num
 directory = "TD3_preTrained" + '/' + 'resource_allocation' + '/' 
-checkpoint_path = directory + "TD364_{}_{}_{}.pth".format('resource_allocation', random_seed, run_num_pretrained)
+checkpoint_path = directory + "TD3256_{}_{}_{}.pth".format('resource_allocation', random_seed, run_num_pretrained)
 print("loading network from : " + checkpoint_path)
 td3_agent.load(checkpoint_path)
 state = env.reset()

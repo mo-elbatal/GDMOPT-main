@@ -26,7 +26,7 @@ class Env():
         self.w1 = args.w1
         self.w2 = args.w2
         self.w3 = args.w3
-    
+
         #  data paths
         self.machine_meta_path = os.path.join('data', 'machine_meta.csv')
         self.machine_usage_path = os.path.join('data', 'machine_usage.csv')
@@ -196,7 +196,6 @@ class Env():
     
     def sample_action(self):
         rand_machine = random.randint(0, self.n_machines-1)
-        # machine_id = self.machine_meta.iloc[rand_machine]['machine_id']
         return rand_machine
     
 class Task(object):

@@ -148,7 +148,7 @@ class TD3:
             state = torch.FloatTensor(state).to(device)
             action, action_logprob = self.policy_old.act(state)
             
-        self.buffer.states.append(state)
+        self.buffer.states1.append(state)
         self.buffer.actions.append(action)
         self.buffer.logprobs.append(action_logprob)
 
@@ -168,7 +168,7 @@ class TD3:
             epsilon = torch.randn_like(pi_targ) * target_noise
             epsilon = torch.clamp(epsilon, -noise_clip, noise_clip)
             a2 = pi_targ + epsilon
-            #a2 = torch.clamp(a2, -act_limit, act_limit)
+            a2 = torch.clamp(a2, 0, act_limit)
 
             # Target Q-values
             q1_pi_targ = self.policy.critic1(o2, a2)
@@ -263,7 +263,7 @@ gamma = 0.99                # discount factor
 lr_actor = 0.0003       # learning rate for actor network
 lr_critic = 0.001       # learning rate for critic network
 random_seed = 0         # set random seed
-max_training_timesteps = int(1e5)   # break training loop if timeteps > max_training_timesteps
+max_training_timesteps = int(1e5)   # break training loop if timesteps > max_training_timesteps
 print_freq = max_ep_len * 4     # print avg reward in the interval (in num timesteps)
 log_freq = max_ep_len * 2       # log avg reward in the interval (in num timesteps)
 save_model_freq = max_ep_len * 4 # save model frequency (in num timesteps)
@@ -287,9 +287,8 @@ state_dim = args.n_servers * args.n_resources + args.n_resources + 1
 # action space dimension
 action_dim = args.n_servers
 
-# Not implemented yet - clamping action from 0,1,2,...,M (representing a virtual machine O-DU) 
 # # Action limit for clamping: critically, assumes all dimensions share the same bound!
-# act_limit = env.action_space.high[0]
+act_limit = args.n_servers
 
 ## Note : print/log frequencies should be > than max_ep_len
 

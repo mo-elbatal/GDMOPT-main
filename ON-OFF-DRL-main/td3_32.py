@@ -1,233 +1,178 @@
-'''
-@article{SpinningUp2018,
-    author = {Achiam, Joshua},
-    title = {{Spinning Up in Deep Reinforcement Learning}},
-    year = {2018}
-}
-'''
+# -*- coding: utf-8 -*-
+############################### Import libraries ###############################
 
-import numpy as np
-import scipy.signal
-
-import torch
-from torch.optim import Adam
-import torch.nn as nn
-from copy import deepcopy
+import os
 import itertools
-import gym
-import time
-import os.path as osp
-from logx import EpochLogger
+from datetime import datetime
+import torch
+import torch.nn as nn
+from torch.distributions import Categorical
+import numpy as np
+from env import Env
+from argparser import args
+from time import sleep
 
-######## core functions ###########
-def combined_shape(length, shape=None):
-    if shape is None:
-        return (length,)
-    return (length, shape) if np.isscalar(shape) else (length, *shape)
+################################## set device to cpu or cuda ##################################
 
-def mlp(sizes, activation, output_activation=nn.Identity):
-    layers = []
-    for j in range(len(sizes)-1):
-        act = activation if j < len(sizes)-2 else output_activation
-        layers += [nn.Linear(sizes[j], sizes[j+1]), act()]
-    return nn.Sequential(*layers)
+print("============================================================================================")
 
-def count_vars(module):
-    return sum([np.prod(p.shape) for p in module.parameters()])
+# set device to cpu or cuda
+device = torch.device('cpu')
 
-class MLPActor(nn.Module):
+if(torch.cuda.is_available()): 
+    device = torch.device('cuda:0') 
+    torch.cuda.empty_cache()
+    print("Device set to : " + str(torch.cuda.get_device_name(device)))
+else:
+    print("Device set to : cpu")
+    
+print("============================================================================================")
 
-    def __init__(self, obs_dim, act_dim, hidden_sizes, activation, act_limit):
-        super().__init__()
-        pi_sizes = [obs_dim] + list(hidden_sizes) + [act_dim]
-        self.pi = mlp(pi_sizes, activation, nn.Tanh)
-        self.act_limit = act_limit
+################################## Define TD3 Policy ##################################
 
-    def forward(self, obs):
-        # Return output from network scaled to action space limits.
-        return self.act_limit * self.pi(obs)
 
-class MLPQFunction(nn.Module):
+class RolloutBuffer:
+    def __init__(self):
+        self.actions = []
+        self.states1 = []
+        self.states2 = []
+        self.logprobs = []
+        self.rewards = []
+        self.is_terminals = []
+    
 
-    def __init__(self, obs_dim, act_dim, hidden_sizes, activation):
-        super().__init__()
-        self.q = mlp([obs_dim + act_dim] + list(hidden_sizes) + [1], activation)
-
-    def forward(self, obs, act):
-        q = self.q(torch.cat([obs, act], dim=-1))
-        return torch.squeeze(q, -1) # Critical to ensure q has right shape.
-
-class MLPActorCritic(nn.Module):
-
-    def __init__(self, observation_space, action_space, hidden_sizes=(256,256),
-                 activation=nn.ReLU):
-        super().__init__()
-
-        obs_dim = observation_space.shape[0]
-        act_dim = action_space.shape[0]
-        act_limit = action_space.high[0]
-
-        # build policy and value functions
-        self.pi = MLPActor(obs_dim, act_dim, hidden_sizes, activation, act_limit)
-        self.q1 = MLPQFunction(obs_dim, act_dim, hidden_sizes, activation)
-        self.q2 = MLPQFunction(obs_dim, act_dim, hidden_sizes, activation)
-
-    def act(self, obs):
-        with torch.no_grad():
-            return self.pi(obs).numpy()
-        
-###### TD3 ########
-
-class ReplayBuffer:
-    def __init__(self, obs_dim, act_dim, size):
-        self.obs_buf = np.zeros(combined_shape(size, obs_dim), dtype=np.float32)
-        self.obs2_buf = np.zeros(combined_shape(size, obs_dim), dtype=np.float32)
-        self.act_buf = np.zeros(combined_shape(size, act_dim), dtype=np.float32)
-        self.rew_buf = np.zeros(size, dtype=np.float32)
-        self.done_buf = np.zeros(size, dtype=np.float32)
-        self.ptr, self.size, self.max_size = 0, 0, size
-
-    def store(self, obs, act, rew, next_obs, done):
-        self.obs_buf[self.ptr] = obs
-        self.obs2_buf[self.ptr] = next_obs
-        self.act_buf[self.ptr] = act
-        self.rew_buf[self.ptr] = rew
-        self.done_buf[self.ptr] = done
-        self.ptr = (self.ptr+1) % self.max_size
-        self.size = min(self.size+1, self.max_size)
+    def clear(self):
+        del self.actions[:]
+        del self.states1[:]
+        del self.states2[:]
+        del self.logprobs[:]
+        del self.rewards[:]
+        del self.is_terminals[:]
 
     def sample_batch(self, batch_size=32):
         idxs = np.random.randint(0, self.size, size=batch_size)
-        batch = dict(obs=self.obs_buf[idxs],
-                     obs2=self.obs2_buf[idxs],
-                     act=self.act_buf[idxs],
-                     rew=self.rew_buf[idxs],
-                     done=self.done_buf[idxs])
+        batch = dict(obs=self.states1[idxs],
+                        obs2=self.states2[idxs],
+                        act=self.actions[idxs],
+                        rew=self.rewards[idxs],
+                        done=self.is_terminals[idxs])
         return {k: torch.as_tensor(v, dtype=torch.float32) for k,v in batch.items()}
-
-
-def td3(env_fn, actor_critic=MLPActorCritic, ac_kwargs=dict(), seed=0, 
-        steps_per_epoch=4000, epochs=100, replay_size=int(1e6), gamma=0.99, 
-        polyak=0.995, pi_lr=1e-3, q_lr=1e-3, batch_size=100, start_steps=10000, 
-        update_after=1000, update_every=50, act_noise=0.1, target_noise=0.2, 
-        noise_clip=0.5, policy_delay=2, num_test_episodes=10, max_ep_len=1000, 
-        logger_kwargs=dict(), save_freq=1):
-    """
-    Twin Delayed Deep Deterministic Policy Gradient (TD3)
-
-        actor_critic: The constructor method for a PyTorch Module with an ``act`` 
-            method, a ``pi`` module, a ``q1`` module, and a ``q2`` module.
-            The ``act`` method and ``pi`` module should accept batches of 
-            observations as inputs, and ``q1`` and ``q2`` should accept a batch 
-            of observations and a batch of actions as inputs. When called, 
-            these should return:
-
-        ac_kwargs (dict): Any kwargs appropriate for the ActorCritic object 
-            you provided to TD3.
-
-        polyak (float): Interpolation factor in polyak averaging for target 
-            networks. Target networks are updated towards main networks 
-            according to:
-
-            .. math:: \\theta_{\\text{targ}} \\leftarrow 
-                \\rho \\theta_{\\text{targ}} + (1-\\rho) \\theta
-
-            where :math:`\\rho` is polyak. (Always between 0 and 1, usually 
-            close to 1.)
-
-        pi_lr (float): Learning rate for policy.
-
-        q_lr (float): Learning rate for Q-networks.
-
-        batch_size (int): Minibatch size for SGD.
-
-        start_steps (int): Number of steps for uniform-random action selection,
-            before running real policy. Helps exploration.
-
-        update_after (int): Number of env interactions to collect before
-            starting to do gradient descent updates. Ensures replay buffer
-            is full enough for useful updates.
-
-        update_every (int): Number of env interactions that should elapse
-            between gradient descent updates. Note: Regardless of how long 
-            you wait between updates, the ratio of env steps to gradient steps 
-            is locked to 1.
-
-        act_noise (float): Stddev for Gaussian exploration noise added to 
-            policy at training time. (At test time, no noise is added.)
-
-        target_noise (float): Stddev for smoothing noise added to target 
-            policy.
-
-        noise_clip (float): Limit for absolute value of target policy 
-            smoothing noise.
-
-        policy_delay (int): Policy will only be updated once every 
-            policy_delay times for each update of the Q-networks.
-
-        num_test_episodes (int): Number of episodes to test the deterministic
-            policy at the end of each epoch.
-
-        max_ep_len (int): Maximum length of trajectory / episode / rollout.
-
-        logger_kwargs (dict): Keyword args for EpochLogger.
-
-        save_freq (int): How often (in terms of gap between epochs) to save
-            the current policy and value function.
-
-    """
-
-    logger = EpochLogger(**logger_kwargs)
-    logger.save_config(locals())
-
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-
-    env, test_env = env_fn(), env_fn()
-    obs_dim = env.observation_space.shape
-    act_dim = env.action_space.shape[0]
-
-    # Action limit for clamping: critically, assumes all dimensions share the same bound!
-    act_limit = env.action_space.high[0]
-
-    # Create actor-critic module and target networks
-    ac = actor_critic(env.observation_space, env.action_space, **ac_kwargs)
-    ac_targ = deepcopy(ac)
-
-    # Freeze target networks with respect to optimizers (only update via polyak averaging)
-    for p in ac_targ.parameters():
-        p.requires_grad = False
         
-    # List of parameters for both Q-networks (save this for convenience)
-    q_params = itertools.chain(ac.q1.parameters(), ac.q2.parameters())
+class ActorCritic(nn.Module):
+    def __init__(self, state_dim, action_dim, action_std_init):
+        super(ActorCritic, self).__init__()
+        
+        # actor
+        self.actor = nn.Sequential(
+            nn.Linear(state_dim, 32),
+            nn.Tanh(),
+            nn.Linear(32, 32),
+            nn.Tanh(),
+            nn.Linear(32, action_dim),
+            nn.Softmax(dim=-1)
+            )
 
-    # Experience buffer
-    replay_buffer = ReplayBuffer(obs_dim=obs_dim, act_dim=act_dim, size=replay_size)
+        
+        # critic
+        self.critic1 = nn.Sequential(
+                        nn.Linear(state_dim, 32),
+                        nn.Tanh(),
+                        nn.Linear(32, 32),
+                        nn.Tanh(),
+                        nn.Linear(32, 1)
+                    )
+        
+        #critic2
+        self.critic2 = nn.Sequential(
+                        nn.Linear(state_dim, 32),
+                        nn.Tanh(),
+                        nn.Linear(32, 32),
+                        nn.Tanh(),
+                        nn.Linear(32, 1)
+                    )
+    
 
-    # Count variables (protip: try to get a feel for how different size networks behave!)
-    var_counts = tuple(count_vars(module) for module in [ac.pi, ac.q1, ac.q2])
-    logger.log('\nNumber of parameters: \t pi: %d, \t q1: %d, \t q2: %d\n'%var_counts)
+    def act(self, state):
 
-    # Set up function for computing TD3 Q-losses
-    def compute_loss_q(data):
+        action_probs = self.actor(state)
+        dist = Categorical(action_probs)
+
+        action = dist.sample()
+        action_logprob = dist.log_prob(action)
+        
+        return action.detach(), action_logprob.detach()
+    
+    def evaluate(self, state, action):
+
+        action_probs = self.actor(state)
+        dist = Categorical(action_probs)
+
+        action_logprobs = dist.log_prob(action)
+        dist_entropy = dist.entropy()
+        state_values1 = self.critic1(state)
+        state_values2 = self.critic2(state)
+        
+        return action_logprobs, state_values1, state_values2, dist_entropy
+    
+class TD3:
+    def __init__(self, state_dim, action_dim, lr_actor, lr_critic, gamma, K_epochs, eps_clip, action_std_init=0.6):
+
+        self.gamma = gamma
+        self.eps_clip = eps_clip
+        self.K_epochs = K_epochs
+        
+        self.buffer = RolloutBuffer()
+
+        self.policy = ActorCritic(state_dim, action_dim, action_std_init).to(device)
+        self.optimizer = torch.optim.Adam([
+                        {'params': self.policy.actor.parameters(), 'lr': lr_actor},
+                        {'params': self.policy.critic1.parameters(), 'lr': lr_critic}, 
+                        {'params': self.policy.critic2.parameters(), 'lr': lr_critic}
+                    ])
+                
+        # Freeze target networks with respect to optimizers (only update via polyak averaging)
+        for p in self.policy.parameters():
+            p.requires_grad = False
+
+        # List of parameters for both Q-networks (save this for convenience)
+        q_params = itertools.chain(self.policy.critic1.parameters(), self.policy.critic2.parameters())
+
+        self.policy_old = ActorCritic(state_dim, action_dim, action_std_init).to(device)
+        self.policy_old.load_state_dict(self.policy.state_dict())
+        
+        self.MseLoss = nn.MSELoss()
+
+    def select_action(self, state):
+
+        with torch.no_grad():
+            state = torch.FloatTensor(state).to(device)
+            action, action_logprob = self.policy_old.act(state)
+            
+        self.buffer.states1.append(state)
+        self.buffer.actions.append(action)
+        self.buffer.logprobs.append(action_logprob)
+
+        return action.item()
+    
+    # setup function to compute TD3 Q-losses
+    def compute_loss_q(self, data):
         o, a, r, o2, d = data['obs'], data['act'], data['rew'], data['obs2'], data['done']
-
-        q1 = ac.q1(o,a)
-        q2 = ac.q2(o,a)
+        q1 = self.policy.critic1(o,a)
+        q2 = self.policy.critic2(o,a)
 
         # Bellman backup for Q functions
         with torch.no_grad():
-            pi_targ = ac_targ.pi(o2)
+            pi_targ = self.policy.actor(o2)
 
             # Target policy smoothing
             epsilon = torch.randn_like(pi_targ) * target_noise
             epsilon = torch.clamp(epsilon, -noise_clip, noise_clip)
             a2 = pi_targ + epsilon
-            a2 = torch.clamp(a2, -act_limit, act_limit)
+            a2 = torch.clamp(a2, 0, act_limit)
 
             # Target Q-values
-            q1_pi_targ = ac_targ.q1(o2, a2)
-            q2_pi_targ = ac_targ.q2(o2, a2)
+            q1_pi_targ = self.policy.critic1(o2, a2)
+            q2_pi_targ = self.policy.critic2(o2, a2)
             q_pi_targ = torch.min(q1_pi_targ, q2_pi_targ)
             backup = r + gamma * (1 - d) * q_pi_targ
 
@@ -241,262 +186,323 @@ def td3(env_fn, actor_critic=MLPActorCritic, ac_kwargs=dict(), seed=0,
                          Q2Vals=q2.detach().numpy())
 
         return loss_q, loss_info
-
+    
+    
     # Set up function for computing TD3 pi loss
-    def compute_loss_pi(data):
+    def compute_loss_pi(self, data):
         o = data['obs']
-        q1_pi = ac.q1(o, ac.pi(o))
+        q1_pi = self.policy.critic1(o, self.actor(o))
         return -q1_pi.mean()
-
-    # Set up optimizers for policy and q-function
-    pi_optimizer = Adam(ac.pi.parameters(), lr=pi_lr)
-    q_optimizer = Adam(q_params, lr=q_lr)
-
-    # Set up model saving
-    logger.setup_pytorch_saver(ac)
-
-    def update(data, timer):
+    
+    def update(self, data, timer):
         # First run one gradient descent step for Q1 and Q2
-        q_optimizer.zero_grad()
-        loss_q, loss_info = compute_loss_q(data)
+        self.q_optimizer.zero_grad()
+        loss_q, loss_info = self.compute_loss_q(data)
         loss_q.backward()
-        q_optimizer.step()
-
-        # Record things
-        logger.store(LossQ=loss_q.item(), **loss_info)
+        self.q_optimizer.step()        
+        
 
         # Possibly update pi and target networks
         if timer % policy_delay == 0:
 
             # Freeze Q-networks so you don't waste computational effort 
             # computing gradients for them during the policy learning step.
-            for p in q_params:
+            for p in self.q_params:
                 p.requires_grad = False
 
             # Next run one gradient descent step for pi.
-            pi_optimizer.zero_grad()
-            loss_pi = compute_loss_pi(data)
+            self.pi_optimizer.zero_grad()
+            loss_pi = self.compute_loss_pi(data)
             loss_pi.backward()
-            pi_optimizer.step()
+            self.pi_optimizer.step()
 
             # Unfreeze Q-networks so you can optimize it at next DDPG step.
-            for p in q_params:
+            for p in self.q_params:
                 p.requires_grad = True
-
-            # Record things
-            logger.store(LossPi=loss_pi.item())
 
             # Finally, update target networks by polyak averaging.
             with torch.no_grad():
-                for p, p_targ in zip(ac.parameters(), ac_targ.parameters()):
+                for p, p_targ in zip(self.policy.parameters(), self.policy.parameters()):
                     # NB: We use an in-place operations "mul_", "add_" to update target
                     # params, as opposed to "mul" and "add", which would make new tensors.
                     p_targ.data.mul_(polyak)
                     p_targ.data.add_((1 - polyak) * p.data)
 
-    def get_action(o, noise_scale):
-        a = ac.act(torch.as_tensor(o, dtype=torch.float32))
-        a += noise_scale * np.random.randn(act_dim)
-        return np.clip(a, -act_limit, act_limit)
+            
+        # Copy new weights into old policy
+        self.policy_old.load_state_dict(self.policy.state_dict())
 
-    def test_agent():
-        for j in range(num_test_episodes):
-            o, d, ep_ret, ep_len = test_env.reset(), False, 0, 0
-            while not(d or (ep_len == max_ep_len)):
-                # Take deterministic actions at test time (noise_scale=0)
-                o, r, d, _ = test_env.step(get_action(o, 0))
-                ep_ret += r
-                ep_len += 1
-            logger.store(TestEpRet=ep_ret, TestEpLen=ep_len)
+        # clear buffer
+        self.buffer.clear()
+    
+    
+    def save(self, checkpoint_path):
+        torch.save(self.policy_old.state_dict(), checkpoint_path)
+   
 
-    # Prepare for interaction with environment
-    total_steps = steps_per_epoch * epochs
-    start_time = time.time()
-    o, ep_ret, ep_len = env.reset(), 0, 0
-
-    # Main loop: collect experience in env and update/log each epoch
-    for t in range(total_steps):
+    def load(self, checkpoint_path):
+        self.policy_old.load_state_dict(torch.load(checkpoint_path, map_location=lambda storage, loc: storage))
+        self.policy.load_state_dict(torch.load(checkpoint_path, map_location=lambda storage, loc: storage))
         
-        # Until start_steps have elapsed, randomly sample actions
-        # from a uniform distribution for better exploration. Afterwards, 
-        # use the learned policy (with some noise, via act_noise). 
+################################# End of Part I ################################
+
+print("============================================================================================")
+
+
+################################### Training ###################################
+
+
+################ initialize environment hyperparameters and TD3 hyperparameters ################
+
+print("setting training environment : ")
+
+max_ep_len = 200                     # max timesteps in one episode
+K_epochs = 40               # update policy for K epochs
+eps_clip = 0.2              # clip parameter for TD3
+gamma = 0.99                # discount factor
+lr_actor = 0.0003       # learning rate for actor network
+lr_critic = 0.001       # learning rate for critic network
+random_seed = 0         # set random seed
+max_training_timesteps = int(1e5)   # break training loop if timeteps > max_training_timesteps
+print_freq = max_ep_len * 4     # print avg reward in the interval (in num timesteps)
+log_freq = max_ep_len * 2       # log avg reward in the interval (in num timesteps)
+save_model_freq = max_ep_len * 4 # save model frequency (in num timesteps)
+action_std = None
+### new for td3
+polyak=0.995
+batch_size=100
+policy_delay=2
+act_noise=0.1
+target_noise=0.2
+noise_clip=0.5
+update_after = max_ep_len * 4      # update policy every n timesteps
+update_every=50
+start_steps=10000
+
+env=Env()
+
+# state space dimension
+state_dim = args.n_servers * args.n_resources + args.n_resources + 1
+
+# action space dimension
+action_dim = args.n_servers
+
+# # Action limit for clamping: critically, assumes all dimensions share the same bound!
+act_limit = args.n_servers
+
+## Note : print/log frequencies should be > than max_ep_len
+
+###################### logging ######################
+
+#### log files for multiple runs are NOT overwritten
+
+log_dir = "TD3_files"
+if not os.path.exists(log_dir):
+      os.makedirs(log_dir)
+
+log_dir_1 = log_dir + '/' + 'resource_allocation' + '/' + 'stability' + '/'
+if not os.path.exists(log_dir_1):
+      os.makedirs(log_dir_1)
+log_dir_2 = log_dir + '/' + 'resource_allocation' + '/' + 'reward' + '/'
+if not os.path.exists(log_dir_2):
+      os.makedirs(log_dir_2)
+
+
+#### get number of log files in log directory
+run_num = 0
+current_num_files1 = next(os.walk(log_dir_1))[2]
+run_num1 = len(current_num_files1)
+current_num_files2 = next(os.walk(log_dir_2))[2]
+run_num2 = len(current_num_files2)
+
+#### create new saving file for each run 
+log_f_name = log_dir_1 + '/TD3_' + 'resource_allocation' + "_log_" + str(run_num1) + ".csv"
+log_f_name2 = log_dir_2 + '/TD3_' + 'resource_allocation' + "_log_" + str(run_num2) + ".csv"
+
+print("current logging run number for " + 'resource_allocation' + " : ", run_num1)
+print("logging at : " + log_f_name)
+#####################################################
+
+################### checkpointing ###################
+
+run_num_pretrained = 0      #### change this to prevent overwriting weights in same env_name folder
+
+directory = "TD3_preTrained"
+if not os.path.exists(directory):
+      os.makedirs(directory)
+
+directory = directory + '/' + 'resource_allocation' + '/'
+if not os.path.exists(directory):
+      os.makedirs(directory)
+
+
+checkpoint_path = directory + "TD332_{}_{}_{}.pth".format('resource_allocation', random_seed, run_num_pretrained)
+print("save checkpoint path : " + checkpoint_path)
+
+#####################################################
+
+
+############# print all hyperparameters #############
+
+print("--------------------------------------------------------------------------------------------")
+
+print("max training timesteps : ", max_training_timesteps)
+print("max timesteps per episode : ", max_ep_len)
+
+print("model saving frequency : " + str(save_model_freq) + " timesteps")
+print("log frequency : " + str(log_freq) + " timesteps")
+print("printing average reward over episodes in last : " + str(print_freq) + " timesteps")
+
+print("--------------------------------------------------------------------------------------------")
+
+print("state space dimension : ", state_dim)
+print("action space dimension : ", action_dim)
+
+print("--------------------------------------------------------------------------------------------")
+
+print("TD3 update frequency : " + str(update_after) + " timesteps") 
+print("TD3 K epochs : ", K_epochs)
+print("TD3 epsilon clip : ", eps_clip)
+print("discount factor (gamma) : ", gamma)
+
+print("--------------------------------------------------------------------------------------------")
+
+print("optimizer learning rate actor : ", lr_actor)
+print("optimizer learning rate critic : ", lr_critic)
+
+print("--------------------------------------------------------------------------------------------")
+
+print("polyak averaging factor : ", polyak)
+print("batch size : ", batch_size)
+print("policy delay: ", policy_delay)
+print("--------------------------------------------------------------------------------------------")
+
+print("Actor Network Noise : ", act_noise)
+print("Target Networks Noise : ", target_noise)
+print("Noise Clip : ", noise_clip)
+
+print("--------------------------------------------------------------------------------------------")
+print("setting random seed to ", random_seed)
+torch.manual_seed(random_seed)
+np.random.seed(random_seed)
+
+#####################################################
+
+print("============================================================================================")
+
+################# training procedure ################
+
+# initialize a TD3 agent
+td3_agent = TD3(state_dim, action_dim, lr_actor, lr_critic, gamma, K_epochs, eps_clip, action_std)
+
+start_time = datetime.now().replace(microsecond=0)
+print("Started training at (GMT) : ", start_time)
+
+print("============================================================================================")
+
+
+# logging file
+log_f = open(log_f_name,"w+")
+log_f.write('episode,timestep,reward\n')
+log_f2 = open(log_f_name2,"w+")
+log_f2.write('episode,timestep,reward\n')
+
+# printing and logging variables
+print_running_reward = 0
+print_running_episodes = 0
+
+log_running_reward = 0
+log_running_episodes = 0
+
+time_step = 0
+i_episode = 0
+rewards = []
+
+# start training loop
+while time_step <= max_training_timesteps:
+    print("New training episode:")
+    sleep(0.1) # we sleep to read the reward in console
+    state = env.reset()
+    current_ep_reward = 0
+
+    for t in range(1, max_ep_len+1):
+        
+        # select action with policy
         if t > start_steps:
-            a = get_action(o, act_noise)
+            action = td3_agent.select_action(state, act_noise)
         else:
-            a = env.action_space.sample()
+            action = env.sample_action()
 
-        # Step the env
-        o2, r, d, _ = env.step(a)
-        ep_ret += r
-        ep_len += 1
+        state2, reward, done, _ = env.step(action)
+        
+        # saving reward and is_terminals
+        td3_agent.buffer.rewards.append(reward)
+        td3_agent.buffer.is_terminals.append(done)
+        state = state2
 
-        # Ignore the "done" signal if it comes from hitting the time
-        # horizon (that is, when it's an artificial terminal signal
-        # that isn't based on the agent's state)
-        d = False if ep_len==max_ep_len else d
-
-        # Store experience to replay buffer
-        replay_buffer.store(o, a, r, o2, d)
-
-        # Super critical, easy to overlook step: make sure to update 
-        # most recent observation!
-        o = o2
-
-        # End of trajectory handling
-        if d or (ep_len == max_ep_len):
-            logger.store(EpRet=ep_ret, EpLen=ep_len)
-            o, ep_ret, ep_len = env.reset(), 0, 0
+        time_step +=1
+        current_ep_reward += reward
+        print("The current total episodic reward at timestep:", time_step, "is:", current_ep_reward)
+        sleep(0.1) # we sleep to read the reward in console
 
         # Update handling
         if t >= update_after and t % update_every == 0:
             for j in range(update_every):
-                batch = replay_buffer.sample_batch(batch_size)
-                update(data=batch, timer=j)
+                batch = td3_agent.buffer.sample_batch(batch_size)
+                td3_agent.update(data=batch, timer=j)
 
-        # End of epoch handling
-        if (t+1) % steps_per_epoch == 0:
-            epoch = (t+1) // steps_per_epoch
+        # log in logging file
+        if time_step % log_freq == 0:
 
-            # Save model
-            if (epoch % save_freq == 0) or (epoch == epochs):
-                logger.save_state({'env': env}, None)
+            # log average reward till last episode
+            log_avg_reward = log_running_reward / log_running_episodes
+            log_avg_reward = round(log_avg_reward, 4)
+            print("Saving reward to csv file")
+            sleep(0.1) # we sleep to read the reward in console
 
-            # Test the performance of the deterministic version of the agent.
-            test_agent()
+            log_f.write('{},{},{}\n'.format(i_episode, time_step, log_avg_reward))
+            log_f.flush()
+            log_f2.write('{},{},{}\n'.format(i_episode, time_step, log_avg_reward))
+            log_f2.flush()
+            log_running_reward = 0
+            log_running_episodes = 0
+            
+        # printing average reward
+        if time_step % print_freq == 0:
 
-            # Log info about epoch
-            logger.log_tabular('Epoch', epoch)
-            logger.log_tabular('EpRet', with_min_and_max=True)
-            logger.log_tabular('TestEpRet', with_min_and_max=True)
-            logger.log_tabular('EpLen', average_only=True)
-            logger.log_tabular('TestEpLen', average_only=True)
-            logger.log_tabular('TotalEnvInteracts', t)
-            logger.log_tabular('Q1Vals', with_min_and_max=True)
-            logger.log_tabular('Q2Vals', with_min_and_max=True)
-            logger.log_tabular('LossPi', average_only=True)
-            logger.log_tabular('LossQ', average_only=True)
-            logger.log_tabular('Time', time.time()-start_time)
-            logger.dump_tabular()
-
-####### setup logger kwargs #########
-
-def setup_logger_kwargs(exp_name, seed=None, data_dir=None, datestamp=False):
-    """
-    Sets up the output_dir for a logger and returns a dict for logger kwargs.
-
-    If no seed is given and datestamp is false, 
-
-    ::
-
-        output_dir = data_dir/exp_name
-
-    If a seed is given and datestamp is false,
-
-    ::
-
-        output_dir = data_dir/exp_name/exp_name_s[seed]
-
-    If datestamp is true, amend to
-
-    ::
-
-        output_dir = data_dir/YY-MM-DD_exp_name/YY-MM-DD_HH-MM-SS_exp_name_s[seed]
-
-    Args:
-
-        exp_name (string): Name for experiment.
-
-        seed (int): Seed for random number generators used by experiment.
-
-        data_dir (string): Path to folder where results should be saved.
-            Default is the ``DEFAULT_DATA_DIR`` in ``spinup/user_config.py``.
-
-        datestamp (bool): Whether to include a date and timestamp in the
-            name of the save directory.
-
-    Returns:
-
-        logger_kwargs, a dict containing output_dir and exp_name.
-    """
-
-    # Make base path
-    ymd_time = time.strftime("%Y-%m-%d_") if datestamp else ''
-    relpath = ''.join([ymd_time, exp_name])
+            # print average reward till last episode
+            print_avg_reward = print_running_reward / print_running_episodes
+            print_avg_reward = round(print_avg_reward, 2)
+            rewards.append(print_avg_reward)
+            print("Episode : {} \t\t Timestep : {} \t\t Average Reward : {}".format(i_episode, time_step, print_avg_reward))
+            sleep(0.1) # we sleep to read the reward in console
+            print_running_reward = 0
+            print_running_episodes = 0
+            
+        # save model weights
+        if time_step % save_model_freq == 0:
+            print("--------------------------------------------------------------------------------------------")
+            print("saving model at : " + checkpoint_path)
+            sleep(0.1) # we sleep to read the reward in console
+            td3_agent.save(checkpoint_path)
+            print("model saved")
+            print("--------------------------------------------------------------------------------------------")
+            
+        # break; if the episode is over
+        if done:
+            break
     
-    if seed is not None:
-        # Make a seed-specific subfolder in the experiment directory.
-        if datestamp:
-            hms_time = time.strftime("%Y-%m-%d_%H-%M-%S")
-            subfolder = ''.join([hms_time, '-', exp_name, '_s', str(seed)])
-        else:
-            subfolder = ''.join([exp_name, '_s', str(seed)])
-        relpath = osp.join(relpath, subfolder)
+    print_running_reward += current_ep_reward
+    print_running_episodes += 1
 
-    DEFAULT_DATA_DIR = osp.join(osp.abspath(osp.dirname(osp.dirname(__file__))),'data')
+    log_running_reward += current_ep_reward
+    log_running_episodes += 1
 
-    data_dir = data_dir or DEFAULT_DATA_DIR
-    logger_kwargs = dict(output_dir=osp.join(data_dir, relpath), 
-                         exp_name=exp_name)
-    return logger_kwargs
+    i_episode += 1
 
 
-if __name__ == '__main__':
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--env', type=str, default='HalfCheetah-v2')
-    parser.add_argument('--hid', type=int, default=256)
-    parser.add_argument('--l', type=int, default=2)
-    parser.add_argument('--gamma', type=float, default=0.99)
-    parser.add_argument('--seed', '-s', type=int, default=0)
-    parser.add_argument('--epochs', type=int, default=50)
-    parser.add_argument('--exp_name', type=str, default='td3')
-    args = parser.parse_args()
+log_f.close()
+log_f2.close()
+print("============================================================================================")
 
-    logger_kwargs = setup_logger_kwargs(args.exp_name, args.seed)
-
-    td3(lambda : gym.make(args.env), actor_critic=MLPActorCritic,
-        ac_kwargs=dict(hidden_sizes=[args.hid]*args.l), 
-        gamma=args.gamma, seed=args.seed, epochs=args.epochs,
-        logger_kwargs=logger_kwargs)
-
-
-## Epoch Logger
-from mpi4py import MPI
-
-def allreduce(*args, **kwargs):
-    return MPI.COMM_WORLD.Allreduce(*args, **kwargs)
-
-def mpi_op(x, op):
-    x, scalar = ([x], True) if np.isscalar(x) else (x, False)
-    x = np.asarray(x, dtype=np.float32)
-    buff = np.zeros_like(x, dtype=np.float32)
-    allreduce(x, buff, op=op)
-    return buff[0] if scalar else buff
-
-def mpi_sum(x):
-    return mpi_op(x, MPI.SUM)
-
-def mpi_statistics_scalar(x, with_min_and_max=False):
-    """
-    Get mean/std and optional min/max of scalar x across MPI processes.
-
-    Args:
-        x: An array containing samples of the scalar to produce statistics
-            for.
-
-        with_min_and_max (bool): If true, return min and max of x in 
-            addition to mean and std.
-    """
-    x = np.array(x, dtype=np.float32)
-    global_sum, global_n = mpi_sum([np.sum(x), len(x)])
-    mean = global_sum / global_n
-
-    global_sum_sq = mpi_sum(np.sum((x - mean)**2))
-    std = np.sqrt(global_sum_sq / global_n)  # compute global std
-
-    if with_min_and_max:
-        global_min = mpi_op(np.min(x) if len(x) > 0 else np.inf, op=MPI.MIN)
-        global_max = mpi_op(np.max(x) if len(x) > 0 else -np.inf, op=MPI.MAX)
-        return mean, std, global_min, global_max
-    return mean, std
-
+################################ End of Part II ################################

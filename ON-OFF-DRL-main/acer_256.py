@@ -91,7 +91,6 @@ class ActorCritic(nn.Module):
             nn.Linear(hidden_size, num_actions)
         )
         
-        
     def forward(self, x):
         policy  = self.actor(x).clamp(max=1-1e-20)
         q_value = self.critic(x)
@@ -172,7 +171,6 @@ print_freq = max_ep_len * 4     # print avg reward in the interval (in num times
 log_freq = max_ep_len * 2       # saving avg reward in the interval (in num timesteps)
 save_model_freq = max_ep_len * 4         # save model frequency (in num timesteps)
 capacity = 10000
-max_episode_length = 200
 
 env=Env()
 
@@ -242,7 +240,7 @@ print("save checkpoint path : " + checkpoint_path)
 print("--------------------------------------------------------------------------------------------")
 
 print("max training timesteps : ", max_training_timesteps)
-print("max timesteps per episode : ", max_episode_length)
+print("max timesteps per episode : ", max_ep_len)
 
 print("model saving frequency : " + str(save_model_freq) + " timesteps")
 print("log frequency : " + str(log_freq) + " timesteps")
@@ -276,7 +274,7 @@ print("=========================================================================
 
 model = ActorCritic(args.n_servers * args.n_resources + args.n_resources + 1, args.n_servers).to(device)
 optimizer = optim.Adam(model.parameters())
-replay_buffer = EpisodicReplayMemory(capacity, max_episode_length)
+replay_buffer = EpisodicReplayMemory(capacity, max_ep_len)
 
 start_time = datetime.now().replace(microsecond=0)
 print("Started training at (GMT) : ", start_time)

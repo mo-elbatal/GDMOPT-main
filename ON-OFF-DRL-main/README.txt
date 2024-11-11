@@ -28,6 +28,4 @@ that contains reward files and trained models respectively.
 - opt.py and greedy.py implement the optimal MIP solution and the greedy solution respectively.
 
 ----- REFERENCES -----
- * https://github.com/higgsfield/RL-Adventure-2
- * https://github.com/nikhilbarhate99/PPO-PyTorch
- * https://github.com/gohsyi/cluster_optimization
+ * https://github.com/nessry/ON-OFF-DRL

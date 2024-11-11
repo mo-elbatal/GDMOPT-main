@@ -25,7 +25,7 @@ if __name__ == '__main__':
         learn_ppo(),
 
         learn_td3(),
-        
+
         Acer(),
 
         Greedy(act_size=args.n_servers, n_servers=args.n_servers),
