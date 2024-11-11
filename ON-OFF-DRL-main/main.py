@@ -15,7 +15,7 @@ from greedy import Greedy
 from opt import Optimal
 from learn_acer import Acer
 from learn_ppo import learn_ppo
-from learn_ddpg import learn_ddpg
+from learn_td3 import learn_td3
 from plot import power_plot, latency_plot
 if __name__ == '__main__':
 
@@ -24,7 +24,7 @@ if __name__ == '__main__':
         
         learn_ppo(),
 
-        learn_ddpg(),
+        learn_td3(),
         
         Acer(),
 
@@ -39,7 +39,7 @@ if __name__ == '__main__':
     for m in models:
         done = False
         obs = env.reset()
-        for _ in tqdm(range(2000)):
+        for _ in tqdm(range(2000)): # tqdm shows smart progress meter
             action = int(m.step(obs))
             _, _, done, info = env.step(action)
 

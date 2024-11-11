@@ -10,6 +10,7 @@ import os
 import heapq
 import pandas as pd
 import numpy as np
+import random
 from collections import deque
 from argparser import args
 
@@ -185,7 +186,7 @@ class Env():
     def calc_total_power(self):
         for m in self.machines:
             return self.P_0 + (self.P_100 - self.P_0) * (2 * m.cpu() - m.cpu()**(1.4))
-        
+    
     def calc_total_latency(self):
         for t in self.tasks:
             latency = [t.start_time - t.arrive_time]
@@ -193,6 +194,10 @@ class Env():
             latency[i] = latency[i] + latency[i - 1]
         return np.sum(latency)
     
+    def sample_action(self):
+        rand_machine = random.randint(0, self.n_machines-1)
+        # machine_id = self.machine_meta.iloc[rand_machine]['machine_id']
+        return rand_machine
     
 class Task(object):
     def __init__(self, name, start_time, end_time, plan_cpu, plan_mem):

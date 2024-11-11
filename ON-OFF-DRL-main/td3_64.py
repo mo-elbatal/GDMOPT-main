@@ -126,9 +126,10 @@ class TD3:
         self.policy = ActorCritic(state_dim, action_dim, action_std_init).to(device)
         self.optimizer = torch.optim.Adam([
                         {'params': self.policy.actor.parameters(), 'lr': lr_actor},
-                        {'params': self.policy.critic.parameters(), 'lr': lr_critic}
+                        {'params': self.policy.critic1.parameters(), 'lr': lr_critic}, 
+                        {'params': self.policy.critic2.parameters(), 'lr': lr_critic}
                     ])
-        
+                
         # Freeze target networks with respect to optimizers (only update via polyak averaging)
         for p in self.policy.parameters():
             p.requires_grad = False
@@ -167,7 +168,7 @@ class TD3:
             epsilon = torch.randn_like(pi_targ) * target_noise
             epsilon = torch.clamp(epsilon, -noise_clip, noise_clip)
             a2 = pi_targ + epsilon
-            a2 = torch.clamp(a2, -act_limit, act_limit)
+            #a2 = torch.clamp(a2, -act_limit, act_limit)
 
             # Target Q-values
             q1_pi_targ = self.policy.critic1(o2, a2)
@@ -192,13 +193,6 @@ class TD3:
         o = data['obs']
         q1_pi = self.policy.critic1(o, self.actor(o))
         return -q1_pi.mean()
-
-
-    # Set up optimizers for policy and q-function
-    def setup_optimizers(self):
-        pi_optimizer = torch.optim.Adam(self.policy.actor.parameters(), lr=lr_actor)
-        q_optimizer = torch.optim.Adam(self.q_params, lr=lr_critic)
-    setup_optimizers()
     
     def update(self, data, timer):
         # First run one gradient descent step for Q1 and Q2
@@ -253,10 +247,14 @@ class TD3:
 ################################# End of Part I ################################
 
 print("============================================================================================")
-random_seed = 0         # set random seed
-torch.manual_seed(random_seed)
-np.random.seed(random_seed)
 
+
+################################### Training ###################################
+
+
+################ initialize environment hyperparameters and TD3 hyperparameters ################
+
+print("setting training environment : ")
 
 max_ep_len = 200                     # max timesteps in one episode
 K_epochs = 40               # update policy for K epochs
@@ -282,46 +280,230 @@ update_every=50
 start_steps=10000
 
 env=Env()
- 
+
 # state space dimension
 state_dim = args.n_servers * args.n_resources + args.n_resources + 1
 
 # action space dimension
 action_dim = args.n_servers
 
-# Action limit for clamping: critically, assumes all dimensions share the same bound!
-act_limit = env.action_space.high[0]
+# Not implemented yet - clamping action from 0,1,2,...,M (representing a virtual machine O-DU) 
+# # Action limit for clamping: critically, assumes all dimensions share the same bound!
+# act_limit = env.action_space.high[0]
+
+## Note : print/log frequencies should be > than max_ep_len
+
+###################### logging ######################
+
+#### log files for multiple runs are NOT overwritten
+
+log_dir = "TD3_files"
+if not os.path.exists(log_dir):
+      os.makedirs(log_dir)
+
+log_dir_1 = log_dir + '/' + 'resource_allocation' + '/' + 'stability' + '/'
+if not os.path.exists(log_dir_1):
+      os.makedirs(log_dir_1)
+log_dir_2 = log_dir + '/' + 'resource_allocation' + '/' + 'reward' + '/'
+if not os.path.exists(log_dir_2):
+      os.makedirs(log_dir_2)
 
 
-# initialize a PPO agent
-td3_agent = TD3(state_dim, action_dim, lr_actor, lr_critic, gamma, K_epochs, eps_clip, action_std)
-# preTrained weights directory
-random_seed = 0             #### set this to load a particular checkpoint trained on random seed
-run_num_pretrained = 0      #### set this to load a particular checkpoint num
-directory = "TD3_preTrained" + '/' + 'resource_allocation' + '/' 
+#### get number of log files in log directory
+run_num = 0
+current_num_files1 = next(os.walk(log_dir_1))[2]
+run_num1 = len(current_num_files1)
+current_num_files2 = next(os.walk(log_dir_2))[2]
+run_num2 = len(current_num_files2)
+
+#### create new saving file for each run 
+log_f_name = log_dir_1 + '/TD3_' + 'resource_allocation' + "_log_" + str(run_num1) + ".csv"
+log_f_name2 = log_dir_2 + '/TD3_' + 'resource_allocation' + "_log_" + str(run_num2) + ".csv"
+
+print("current logging run number for " + 'resource_allocation' + " : ", run_num1)
+print("logging at : " + log_f_name)
+#####################################################
+
+################### checkpointing ###################
+
+run_num_pretrained = 0      #### change this to prevent overwriting weights in same env_name folder
+
+directory = "TD3_preTrained"
+if not os.path.exists(directory):
+      os.makedirs(directory)
+
+directory = directory + '/' + 'resource_allocation' + '/'
+if not os.path.exists(directory):
+      os.makedirs(directory)
+
+
 checkpoint_path = directory + "TD364_{}_{}_{}.pth".format('resource_allocation', random_seed, run_num_pretrained)
-print("loading network from : " + checkpoint_path)
-td3_agent.load(checkpoint_path)
-state = env.reset()
+print("save checkpoint path : " + checkpoint_path)
+
+#####################################################
+
+
+############# print all hyperparameters #############
+
 print("--------------------------------------------------------------------------------------------")
 
+print("max training timesteps : ", max_training_timesteps)
+print("max timesteps per episode : ", max_ep_len)
 
-class learn_td3(object):
-    
-    def __init__(self):
-        self.name = 'TD3'
+print("model saving frequency : " + str(save_model_freq) + " timesteps")
+print("log frequency : " + str(log_freq) + " timesteps")
+print("printing average reward over episodes in last : " + str(print_freq) + " timesteps")
 
-    def step(self, obs):
-        state = obs
-        done = False
-        for t in range(1, max_ep_len+1):
-            action = td3_agent.select_action(state)
-            state, reward, done, _ = env.step(action)
-            if done:
-                break
-        # clear buffer    
-        td3_agent.buffer.clear()
+print("--------------------------------------------------------------------------------------------")
 
-        print("============================================================================================")
+print("state space dimension : ", state_dim)
+print("action space dimension : ", action_dim)
+
+print("--------------------------------------------------------------------------------------------")
+
+print("TD3 update frequency : " + str(update_after) + " timesteps") 
+print("TD3 K epochs : ", K_epochs)
+print("TD3 epsilon clip : ", eps_clip)
+print("discount factor (gamma) : ", gamma)
+
+print("--------------------------------------------------------------------------------------------")
+
+print("optimizer learning rate actor : ", lr_actor)
+print("optimizer learning rate critic : ", lr_critic)
+
+print("--------------------------------------------------------------------------------------------")
+
+print("polyak averaging factor : ", polyak)
+print("batch size : ", batch_size)
+print("policy delay: ", policy_delay)
+print("--------------------------------------------------------------------------------------------")
+
+print("Actor Network Noise : ", act_noise)
+print("Target Networks Noise : ", target_noise)
+print("Noise Clip : ", noise_clip)
+
+print("--------------------------------------------------------------------------------------------")
+print("setting random seed to ", random_seed)
+torch.manual_seed(random_seed)
+np.random.seed(random_seed)
+
+#####################################################
+
+print("============================================================================================")
+
+################# training procedure ################
+
+# initialize a TD3 agent
+td3_agent = TD3(state_dim, action_dim, lr_actor, lr_critic, gamma, K_epochs, eps_clip, action_std)
+
+start_time = datetime.now().replace(microsecond=0)
+print("Started training at (GMT) : ", start_time)
+
+print("============================================================================================")
+
+
+# logging file
+log_f = open(log_f_name,"w+")
+log_f.write('episode,timestep,reward\n')
+log_f2 = open(log_f_name2,"w+")
+log_f2.write('episode,timestep,reward\n')
+
+# printing and logging variables
+print_running_reward = 0
+print_running_episodes = 0
+
+log_running_reward = 0
+log_running_episodes = 0
+
+time_step = 0
+i_episode = 0
+rewards = []
+
+# start training loop
+while time_step <= max_training_timesteps:
+    print("New training episode:")
+    sleep(0.1) # we sleep to read the reward in console
+    state = env.reset()
+    current_ep_reward = 0
+
+    for t in range(1, max_ep_len+1):
         
-        return action
+        # select action with policy
+        if t > start_steps:
+            action = td3_agent.select_action(state, act_noise)
+        else:
+            action = env.sample_action()
+
+        state2, reward, done, _ = env.step(action)
+        
+        # saving reward and is_terminals
+        td3_agent.buffer.rewards.append(reward)
+        td3_agent.buffer.is_terminals.append(done)
+        state = state2
+
+        time_step +=1
+        current_ep_reward += reward
+        print("The current total episodic reward at timestep:", time_step, "is:", current_ep_reward)
+        sleep(0.1) # we sleep to read the reward in console
+
+        # Update handling
+        if t >= update_after and t % update_every == 0:
+            for j in range(update_every):
+                batch = td3_agent.buffer.sample_batch(batch_size)
+                td3_agent.update(data=batch, timer=j)
+
+        # log in logging file
+        if time_step % log_freq == 0:
+
+            # log average reward till last episode
+            log_avg_reward = log_running_reward / log_running_episodes
+            log_avg_reward = round(log_avg_reward, 4)
+            print("Saving reward to csv file")
+            sleep(0.1) # we sleep to read the reward in console
+
+            log_f.write('{},{},{}\n'.format(i_episode, time_step, log_avg_reward))
+            log_f.flush()
+            log_f2.write('{},{},{}\n'.format(i_episode, time_step, log_avg_reward))
+            log_f2.flush()
+            log_running_reward = 0
+            log_running_episodes = 0
+            
+        # printing average reward
+        if time_step % print_freq == 0:
+
+            # print average reward till last episode
+            print_avg_reward = print_running_reward / print_running_episodes
+            print_avg_reward = round(print_avg_reward, 2)
+            rewards.append(print_avg_reward)
+            print("Episode : {} \t\t Timestep : {} \t\t Average Reward : {}".format(i_episode, time_step, print_avg_reward))
+            sleep(0.1) # we sleep to read the reward in console
+            print_running_reward = 0
+            print_running_episodes = 0
+            
+        # save model weights
+        if time_step % save_model_freq == 0:
+            print("--------------------------------------------------------------------------------------------")
+            print("saving model at : " + checkpoint_path)
+            sleep(0.1) # we sleep to read the reward in console
+            td3_agent.save(checkpoint_path)
+            print("model saved")
+            print("--------------------------------------------------------------------------------------------")
+            
+        # break; if the episode is over
+        if done:
+            break
+    
+    print_running_reward += current_ep_reward
+    print_running_episodes += 1
+
+    log_running_reward += current_ep_reward
+    log_running_episodes += 1
+
+    i_episode += 1
+
+
+log_f.close()
+log_f2.close()
+print("============================================================================================")
+
+################################ End of Part II ################################
