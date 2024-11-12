@@ -142,10 +142,9 @@ print("loading network from : " + checkpoint_path)
 model = ActorCritic(args.n_servers * args.n_resources + args.n_resources + 1, args.n_servers).to(device)
 optimizer = optim.Adam(model.parameters())
 capacity = 10000
-max_episode_length = 200
-replay_buffer = EpisodicReplayMemory(capacity, max_episode_length)
+max_ep_len = 225
+replay_buffer = EpisodicReplayMemory(capacity, max_ep_len)
 env=Env()
-max_ep_len = 200
 state = env.reset()
 
 class Acer(object):

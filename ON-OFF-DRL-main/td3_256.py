@@ -43,19 +43,19 @@ class ReplayBuffer:
     def sample(self, batch_size):
         batch = random.sample(self.buffer, batch_size)
         state, action, reward, next_state, done = map(np.stack, zip(*batch))
-        return state, action, reward, next_state, done
+        return state, action.squeeze(), reward, next_state, done
     
     def __len__(self):
         return len(self.buffer)
     
 class NormalizedActions:
-    def _action(self, action_tens):
+    def _action(self, action_probs):
         low  = 0
         high = action_dim-1
-        action = action_tens.multinomial(1)
+        action_dist = torch.distributions.Categorical(probs=action_probs)
+        action = action_dist.sample()
         action = low + (action + 1.0) * 0.5 * (high - low)
         action = np.clip(action, low, high)
-        
         return action
 
     def _reverse_action(self, action_tens):
@@ -106,7 +106,7 @@ class PolicyNetwork(nn.Module):
     
     def get_action(self, state):
         state  = torch.FloatTensor(state).unsqueeze(0).to(device)
-        action = self.forward(state)
+        action  = self.forward(state)
         return action
         # return action.detach().cpu().numpy()[0]
 
@@ -119,11 +119,13 @@ class ValueNetwork(nn.Module):
         self.linear3 = nn.Linear(hidden_size, 1)
         
     def forward(self, state, action):
-        action = F.one_hot(action, num_classes=action_dim).int()  # One-hot encode the action
+        action = F.one_hot(action, num_classes=action_dim).float()  # One-hot encode the action
+        action = action.view(state.size(0), -1) # Reshape to (batch_size, action_dim)
         x = torch.cat([state, action], 1)
         x = F.relu(self.linear1(x))
         x = F.relu(self.linear2(x))
         x = self.linear3(x)
+        return x.view(-1, 1)
 
 def td3_update(step,
                 batch_size,
@@ -139,15 +141,13 @@ def td3_update(step,
     state = torch.FloatTensor(state).to(device)
     next_state = torch.FloatTensor(next_state).to(device)
     action = torch.LongTensor(action).to(device)  # For discrete actions, use LongTensor
-    reward = torch.FloatTensor(reward).unsqueeze(1).to(device)
+    reward = torch.FloatTensor(reward).squeeze(1).to(device)
     done = torch.FloatTensor(np.float32(done)).unsqueeze(1).to(device)
-    print("action is: ", action)
 
     # Policy network predicts probabilities for each action
     next_action_probs = target_policy_net(next_state)
     next_action_dist = torch.distributions.Categorical(probs=next_action_probs)
     next_action = next_action_dist.sample()
-    print("next action is: ", next_action)
 
     # Add noise to target actions for exploration, clipped within limits
     noise = torch.normal(0, noise_std, size=next_action.shape).to(device)
@@ -155,10 +155,6 @@ def td3_update(step,
     next_action = torch.clamp(next_action + noise, 0, action_dim - 1).long()
 
     # Get Q-value estimates from target networks, selecting based on `next_action`
-    print("next action is: ", next_action)
-    print("next action dim is: ", next_action.shape)
-    print("next state is: ", next_state)
-    print("next action dim is: ", next_state.shape)
 
     target_q_value1 = target_value_net1(next_state, next_action)
     target_q_value2 = target_value_net2(next_state, next_action)
@@ -170,6 +166,10 @@ def td3_update(step,
     # Calculate Q-values for the current state and chosen action
     q_value1 = value_net1(state, action)
     q_value2 = value_net2(state, action)
+
+    q_value1 = q_value1.view(-1, 1)
+    q_value2 = q_value2.view(-1, 1)
+    expected_q_value = expected_q_value.view(-1, 1)
 
     # Calculate losses for the value networks
     value_loss1 = F.mse_loss(q_value1, expected_q_value.detach())
@@ -217,12 +217,13 @@ replay_buffer_size = 1000000
 lr_actor = 0.0003       # learning rate for actor network
 lr_critic = 0.001       # learning rate for critic network
 max_training_timesteps = 100000   # break from training loop if timeteps > max_training_timesteps
-max_ep_len = 100            # max timesteps in one episode 225
-frame_idx   = 0
+max_ep_len = 100            # max timesteps in one episode, previously 225
 rewards     = []
 batch_size  = 128
 random_seed = 0      
-gamma = 0.99               
+gamma = 0.99     
+decay_rate = 0.995
+epsilon = 1          
 
 print_freq = max_ep_len * 4     # print avg reward in the interval (in num timesteps)
 log_freq = max_ep_len * 2       # saving avg reward in the interval (in num timesteps)
@@ -230,7 +231,7 @@ save_model_freq = max_ep_len * 4         # save model frequency (in num timestep
 capacity = 10000
 
 env = Env()
-# noise = GaussianExploration() for continuous action spaces
+# noise = GaussianExploration() # for continuous action spaces
 
 # state space dimension
 state_dim = args.n_servers * args.n_resources + args.n_resources + 1
@@ -388,19 +389,16 @@ while time_step <= max_training_timesteps:
     actions  = []
     rewards  = []
     masks    = []
-    normalized_actions = NormalizedActions()
 
     target_q_value, expected_q_value = 0.0, 0.0
 
     for step in range(max_ep_len):
-
         action_tens = policy_net.get_action(state)
-        # action_arr = noise.get_action(action_arr, step)  # for continuous action spaces
-        action = normalized_actions._action(action_tens)
-        action = int(action.item())
+        normalized_actions = NormalizedActions()
+        action = normalized_actions._action(action_tens) + np.random.normal(0, 0.1)
+        action = int(np.clip(action, 0, action_dim - 1))
         next_state, reward, done, _ = env.step(action)
         
-        state = next_state
         current_ep_reward += reward
         time_step += 1
         print("The current total episodic reward at timestep:", time_step, "is:", current_ep_reward)
@@ -465,7 +463,7 @@ while time_step <= max_training_timesteps:
         if done:
             break
 
-    next_state = torch.FloatTensor(state).unsqueeze(0).to(device)     
+    next_state = torch.FloatTensor(state).unsqueeze(0).to(device)
     
     print_running_reward += current_ep_reward
     print_running_episodes += 1

@@ -103,8 +103,8 @@ class Env():
             'seq_no'  # sequence number of this instance
             'total_seq_no',  # total sequence number of this instance
             'cpu_avg',  # average cpu used by the instance, 100 is 1 core
-            'cpu_max',  # average memory used by the instance (normalized)
-            'mem_avg',  # max cpu used by the instance, 100 is 1 core
+            'cpu_max',  # max cpu used by the instance, 100 is 1 core
+            'mem_avg',  # average memory used by the instance (normalized)
             'mem_max',  # max memory used by the instance (normalized, [0, 100])
         ]
 
@@ -119,6 +119,10 @@ class Env():
         self.machine_meta = pd.read_csv(self.machine_meta_path, header=None, names=self.machine_meta_cols)
         self.machine_meta = self.machine_meta[self.machine_meta['time_stamp'] == 0]
         self.machine_meta = self.machine_meta[['machine_id', 'cpu_num', 'mem_size']]
+
+        self.batch_instance = pd.read_csv(self.batch_instance_path, header=None, names=self.batch_instance_cols)
+        self.batch_instance = self.batch_instance[(self.batch_instance['cpu_avg'] != "") & (self.batch_instance['mem_avg'] != "")]
+        self.batch_instance = self.batch_instance[['cpu_avg','mem_avg']]
 
         self.batch_task = pd.read_csv(self.batch_task_path, header=None, names=self.batch_task_cols)
         self.batch_task = self.batch_task[self.batch_task['status'] == 'Terminated']
@@ -179,9 +183,24 @@ class Env():
         return np.array(states)  # scale
 
     def get_reward(self, nxt_task):
-        
-        return -self.w1*self.calc_total_power()\
-                -self.w2*self.calc_total_latency()
+        penalty_factor = 0.15
+        reward = -self.w1 * self.calc_total_power() - self.w2 * self.calc_total_latency()
+
+        task_row = None
+        if 'task_name' in self.batch_instance.columns and hasattr(nxt_task, 'name'):
+            # Select the row using task_name if available
+            task_row = self.batch_instance.loc[self.batch_instance['task_name'] == nxt_task.name]
+        elif isinstance(nxt_task, int) and 0 <= nxt_task < len(self.batch_instance):
+            # Fallback to index-based access if task_name is unavailable
+            task_row = self.batch_instance.iloc[[nxt_task]]
+
+        if task_row is not None and not task_row.empty:
+            # Accessing the first entry in case of multiple rows
+            if task_row['cpu_avg'].iloc[0] > 0.9 or task_row['mem_avg'].iloc[0] > 0.9:
+                reward -= self.w3 * penalty_factor  # introduce penalty factor
+
+        return reward
+    
        
     def calc_total_power(self):
         for m in self.machines:

@@ -1,16 +1,16 @@
-# -*- coding: utf-8 -*-
-############################### Import libraries ###############################
-
 import os
-import itertools
 from datetime import datetime
+from collections import deque
+import random
+import numpy as np
 import torch
 import torch.nn as nn
-from torch.distributions import Categorical
-import numpy as np
+import torch.optim as optim
+import torch.nn.functional as F
 from env import Env
 from argparser import args
 from time import sleep
+
 
 ################################## set device to cpu or cuda ##################################
 
@@ -28,281 +28,259 @@ else:
     
 print("============================================================================================")
 
-################################## Define TD3 Policy ##################################
-
-
-class RolloutBuffer:
-    def __init__(self):
-        self.actions = []
-        self.states1 = []
-        self.states2 = []
-        self.logprobs = []
-        self.rewards = []
-        self.is_terminals = []
+class ReplayBuffer:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.buffer = []
+        self.position = 0
     
-
-    def clear(self):
-        del self.actions[:]
-        del self.states1[:]
-        del self.states2[:]
-        del self.logprobs[:]
-        del self.rewards[:]
-        del self.is_terminals[:]
-
-    def sample_batch(self, batch_size=32):
-        idxs = np.random.randint(0, self.size, size=batch_size)
-        batch = dict(obs=self.states1[idxs],
-                        obs2=self.states2[idxs],
-                        act=self.actions[idxs],
-                        rew=self.rewards[idxs],
-                        done=self.is_terminals[idxs])
-        return {k: torch.as_tensor(v, dtype=torch.float32) for k,v in batch.items()}
-        
-class ActorCritic(nn.Module):
-    def __init__(self, state_dim, action_dim, action_std_init):
-        super(ActorCritic, self).__init__()
-
-        self.actor = nn.Sequential(
-            nn.Linear(state_dim, 256),
-            nn.Tanh(),
-            nn.Linear(256, 256),
-            nn.Softmax(dim=1)
-        )
-        
-        self.critic1 = nn.Sequential(
-            nn.Linear(state_dim, 256),
-            nn.Tanh(),
-            nn.Linear(256, action_dim)
-        )
-        
-        self.critic2 = nn.Sequential(
-            nn.Linear(state_dim, 256),
-            nn.Tanh(),
-            nn.Linear(256, action_dim)
-        )
-
-    def act(self, state):
-
-        action_probs = self.actor(state)
-        dist = Categorical(action_probs)
-
-        action = dist.sample()
-        action_logprob = dist.log_prob(action)
-        
-        return action.detach(), action_logprob.detach()
+    def push(self, state, action, reward, next_state, done):
+        if len(self.buffer) < self.capacity:
+            self.buffer.append(None)
+        self.buffer[self.position] = (state, action, reward, next_state, done)
+        self.position = (self.position + 1) % self.capacity
     
-    def evaluate(self, state, action):
-
-        action_probs = self.actor(state)
-        dist = Categorical(action_probs)
-
-        action_logprobs = dist.log_prob(action)
-        dist_entropy = dist.entropy()
-        state_values1 = self.critic1(state)
-        state_values2 = self.critic2(state)
+    def sample(self, batch_size):
+        batch = random.sample(self.buffer, batch_size)
+        state, action, reward, next_state, done = map(np.stack, zip(*batch))
+        return state, action.squeeze(), reward, next_state, done
+    
+    def __len__(self):
+        return len(self.buffer)
+    
+class NormalizedActions:
+    def _action(self, action_probs):
+        low  = 0
+        high = action_dim-1
+        action_dist = torch.distributions.Categorical(probs=action_probs)
+        action = action_dist.sample()
+        action = low + (action + 1.0) * 0.5 * (high - low)
+        action = np.clip(action, low, high)
         
-        return action_logprobs, state_values1, state_values2, dist_entropy
-    
-class TD3:
-    def __init__(self, state_dim, action_dim, lr_actor, lr_critic, gamma, K_epochs, eps_clip, action_std_init=0.6):
+        return action
 
-        self.gamma = gamma
-        self.eps_clip = eps_clip
-        self.K_epochs = K_epochs
+    def _reverse_action(self, action_tens):
+        low  = 0
+        high = action_dim-1
+        action = action_tens.multinomial(1)
+        action = 2 * (action - low) / (high - low) - 1
+        action = np.clip(action, low, high)
         
-        self.buffer = RolloutBuffer()
+        return action
 
-        self.policy = ActorCritic(state_dim, action_dim, action_std_init).to(device)
-        self.optimizer = torch.optim.Adam([
-                        {'params': self.policy.actor.parameters(), 'lr': lr_actor},
-                        {'params': self.policy.critic1.parameters(), 'lr': lr_critic}, 
-                        {'params': self.policy.critic2.parameters(), 'lr': lr_critic}
-                    ])
-                
-        # Freeze target networks with respect to optimizers (only update via polyak averaging)
-        for p in self.policy.parameters():
-            p.requires_grad = False
+# used with continuous action space
+# class GaussianExploration(object):
+#     def __init__(self, max_sigma=1.0, min_sigma=1.0, decay_period=1000000):
+#         self.low  = 0
+#         self.high = action_dim
+#         self.max_sigma = max_sigma
+#         self.min_sigma = min_sigma
+#         self.decay_period = decay_period
+    
+#     def get_action(self, action, t=0):
+#         sigma  = self.max_sigma - (self.max_sigma - self.min_sigma) * min(1.0, t / self.decay_period)
+#         action = action + np.random.normal(size=len(action)) * sigma
+#         return np.clip(action, self.low, self.high)
 
-        # List of parameters for both Q-networks (save this for convenience)
-        q_params = itertools.chain(self.policy.critic1.parameters(), self.policy.critic2.parameters())
+def soft_update(net, target_net, soft_tau=1e-2):
+    for target_param, param in zip(target_net.parameters(), net.parameters()):
+            target_param.data.copy_(
+                target_param.data * (1.0 - soft_tau) + param.data * soft_tau
+            )
 
-        self.policy_old = ActorCritic(state_dim, action_dim, action_std_init).to(device)
-        self.policy_old.load_state_dict(self.policy.state_dict())
+class PolicyNetwork(nn.Module):
+    def __init__(self, num_inputs, num_actions, hidden_size):
+        super(PolicyNetwork, self).__init__()
         
-        self.MseLoss = nn.MSELoss()
-
-    def select_action(self, state):
-
-        with torch.no_grad():
-            state = torch.FloatTensor(state).to(device)
-            action, action_logprob = self.policy_old.act(state)
-            
-        self.buffer.states1.append(state)
-        self.buffer.actions.append(action)
-        self.buffer.logprobs.append(action_logprob)
-
-        return action.item()
-    
-    # setup function to compute TD3 Q-losses
-    def compute_loss_q(self, data):
-        o, a, r, o2, d = data['obs'], data['act'], data['rew'], data['obs2'], data['done']
-        q1 = self.policy.critic1(o,a)
-        q2 = self.policy.critic2(o,a)
-
-        # Bellman backup for Q functions
-        with torch.no_grad():
-            pi_targ = self.policy.actor(o2)
-
-            # Target policy smoothing
-            epsilon = torch.randn_like(pi_targ) * target_noise
-            epsilon = torch.clamp(epsilon, -noise_clip, noise_clip)
-            a2 = pi_targ + epsilon
-            a2 = torch.clamp(a2, 0, act_limit)
-
-            # Target Q-values
-            q1_pi_targ = self.policy.critic1(o2, a2)
-            q2_pi_targ = self.policy.critic2(o2, a2)
-            q_pi_targ = torch.min(q1_pi_targ, q2_pi_targ)
-            backup = r + gamma * (1 - d) * q_pi_targ
-
-        # MSE loss against Bellman backup
-        loss_q1 = ((q1 - backup)**2).mean()
-        loss_q2 = ((q2 - backup)**2).mean()
-        loss_q = loss_q1 + loss_q2
-
-        # Useful info for logging
-        loss_info = dict(Q1Vals=q1.detach().numpy(),
-                         Q2Vals=q2.detach().numpy())
-
-        return loss_q, loss_info
-    
-    
-    # Set up function for computing TD3 pi loss
-    def compute_loss_pi(self, data):
-        o = data['obs']
-        q1_pi = self.policy.critic1(o, self.actor(o))
-        return -q1_pi.mean()
-    
-    def update(self, data, timer):
-        # First run one gradient descent step for Q1 and Q2
-        self.q_optimizer.zero_grad()
-        loss_q, loss_info = self.compute_loss_q(data)
-        loss_q.backward()
-        self.q_optimizer.step()        
+        self.linear1 = nn.Linear(num_inputs, hidden_size)
+        self.linear2 = nn.Linear(hidden_size, hidden_size)
+        self.linear3 = nn.Linear(hidden_size, num_actions)
+        self.softmax = nn.Softmax(dim=1)
         
-
-        # Possibly update pi and target networks
-        if timer % policy_delay == 0:
-
-            # Freeze Q-networks so you don't waste computational effort 
-            # computing gradients for them during the policy learning step.
-            for p in self.q_params:
-                p.requires_grad = False
-
-            # Next run one gradient descent step for pi.
-            self.pi_optimizer.zero_grad()
-            loss_pi = self.compute_loss_pi(data)
-            loss_pi.backward()
-            self.pi_optimizer.step()
-
-            # Unfreeze Q-networks so you can optimize it at next DDPG step.
-            for p in self.q_params:
-                p.requires_grad = True
-
-            # Finally, update target networks by polyak averaging.
-            with torch.no_grad():
-                for p, p_targ in zip(self.policy.parameters(), self.policy.parameters()):
-                    # NB: We use an in-place operations "mul_", "add_" to update target
-                    # params, as opposed to "mul" and "add", which would make new tensors.
-                    p_targ.data.mul_(polyak)
-                    p_targ.data.add_((1 - polyak) * p.data)
-
-            
-        # Copy new weights into old policy
-        self.policy_old.load_state_dict(self.policy.state_dict())
-
-        # clear buffer
-        self.buffer.clear()
+    def forward(self, state):
+        x = F.relu(self.linear1(state))
+        x = F.relu(self.linear2(x))
+        x = F.relu(self.linear3(x))
+        # x = tanh(self.linear3(x)  # tanh function used for continuous-action space values [-1, 1] - interferes with probs
+        x = self.softmax(x)
+        return x
     
-    
-    def save(self, checkpoint_path):
-        torch.save(self.policy_old.state_dict(), checkpoint_path)
-   
+    def get_action(self, state):
+        state  = torch.FloatTensor(state).unsqueeze(0).to(device)
+        action = self.forward(state)
+        return action
+        # return action.detach().cpu().numpy()[0]
 
-    def load(self, checkpoint_path):
-        self.policy_old.load_state_dict(torch.load(checkpoint_path, map_location=lambda storage, loc: storage))
-        self.policy.load_state_dict(torch.load(checkpoint_path, map_location=lambda storage, loc: storage))
+class ValueNetwork(nn.Module):
+    def __init__(self, num_inputs, num_actions, hidden_size):
+        super(ValueNetwork, self).__init__()
         
+        self.linear1 = nn.Linear(num_inputs + num_actions, hidden_size)
+        self.linear2 = nn.Linear(hidden_size, hidden_size)
+        self.linear3 = nn.Linear(hidden_size, 1)
+        
+    def forward(self, state, action):
+        action = F.one_hot(action, num_classes=action_dim).float()  # One-hot encode the action
+        action = action.view(state.size(0), -1) # Reshape to (batch_size, action_dim)
+        x = torch.cat([state, action], 1)
+        x = F.relu(self.linear1(x))
+        x = F.relu(self.linear2(x))
+        x = self.linear3(x)
+        return x.view(-1, 1)
+
+def td3_update(step,
+                batch_size,
+                gamma=0.99,
+                soft_tau=1e-2,
+                noise_std=0.2,
+                noise_clip=0.5,
+                policy_update=2):
+
+    state, action, reward, next_state, done = replay_buffer.sample(batch_size)
+
+    # Convert all to tensors and move to device
+    state = torch.FloatTensor(state).to(device)
+    next_state = torch.FloatTensor(next_state).to(device)
+    action = torch.LongTensor(action).to(device)  # For discrete actions, use LongTensor
+    reward = torch.FloatTensor(reward).squeeze(1).to(device)
+    done = torch.FloatTensor(np.float32(done)).unsqueeze(1).to(device)
+
+    # Policy network predicts probabilities for each action
+    next_action_probs = target_policy_net(next_state)
+    next_action_dist = torch.distributions.Categorical(probs=next_action_probs)
+    next_action = next_action_dist.sample()
+
+    # Add noise to target actions for exploration, clipped within limits
+    noise = torch.normal(0, noise_std, size=next_action.shape).to(device)
+    noise = torch.clamp(noise, -noise_clip, noise_clip)
+    next_action = torch.clamp(next_action + noise, 0, action_dim - 1).long()
+
+    # Get Q-value estimates from target networks, selecting based on `next_action`
+
+    target_q_value1 = target_value_net1(next_state, next_action)
+    target_q_value2 = target_value_net2(next_state, next_action)
+    target_q_value = torch.min(target_q_value1, target_q_value2)
+    
+    # Calculate the expected Q-value
+    expected_q_value = reward + (1.0 - done) * gamma * target_q_value
+
+    # Calculate Q-values for the current state and chosen action
+    q_value1 = value_net1(state, action)
+    q_value2 = value_net2(state, action)
+
+    q_value1 = q_value1.view(-1, 1)
+    q_value2 = q_value2.view(-1, 1)
+    expected_q_value = expected_q_value.view(-1, 1)
+
+    # Calculate losses for the value networks
+    value_loss1 = F.mse_loss(q_value1, expected_q_value.detach())
+    value_loss2 = F.mse_loss(q_value2, expected_q_value.detach())
+
+    # Optimize the value networks
+    value_optimizer1.zero_grad()
+    value_loss1.backward()
+    value_optimizer1.step()
+
+    value_optimizer2.zero_grad()
+    value_loss2.backward()
+    value_optimizer2.step()
+
+    # Policy update at intervals
+    if step % policy_update == 0:
+        # Compute policy loss using action values from value_net1
+        action_probs = policy_net(state)
+        action_dist = torch.distributions.Categorical(probs=action_probs)
+        chosen_action = action_dist.sample()
+        
+        policy_loss = -value_net1(state, action).mean()
+
+        # Optimize the policy network
+        policy_optimizer.zero_grad()
+        policy_loss.backward()
+        policy_optimizer.step()
+
+        # Soft update for target networks
+        soft_update(value_net1, target_value_net1, soft_tau=soft_tau)
+        soft_update(value_net2, target_value_net2, soft_tau=soft_tau)
+        soft_update(policy_net, target_policy_net, soft_tau=soft_tau)
+    
+    return target_q_value, expected_q_value
+
+    
+def load(policy_net, value_net1, value_net2, checkpoint_path):
+    policy_net.load_state_dict(torch.load(checkpoint_path, map_location=lambda storage, loc: storage))
+    value_net1.load_state_dict(torch.load(checkpoint_path, map_location=lambda storage, loc: storage))
+    value_net2.load_state_dict(torch.load(checkpoint_path, map_location=lambda storage, loc: storage))
+
 ################################# End of Part I ################################
+
 print("============================================================================================")
-random_seed = 0         # set random seed
-torch.manual_seed(random_seed)
-np.random.seed(random_seed)
 
-
-max_ep_len = 200                     # max timesteps in one episode
-K_epochs = 40               # update policy for K epochs
-eps_clip = 0.2              # clip parameter for TD3
-gamma = 0.99                # discount factor
+replay_buffer_size = 1000000
 lr_actor = 0.0003       # learning rate for actor network
 lr_critic = 0.001       # learning rate for critic network
-random_seed = 0         # set random seed
-max_training_timesteps = int(1e5)   # break training loop if timeteps > max_training_timesteps
-print_freq = max_ep_len * 4     # print avg reward in the interval (in num timesteps)
-log_freq = max_ep_len * 2       # log avg reward in the interval (in num timesteps)
-save_model_freq = max_ep_len * 4 # save model frequency (in num timesteps)
-action_std = None
-### new for td3
-polyak=0.995
-batch_size=100
-policy_delay=2
-act_noise=0.1
-target_noise=0.2
-noise_clip=0.5
-update_after = max_ep_len * 4      # update policy every n timesteps
-update_every=50
-start_steps=10000
+rewards     = []
 
-env=Env()
- 
 # state space dimension
 state_dim = args.n_servers * args.n_resources + args.n_resources + 1
 
 # action space dimension
 action_dim = args.n_servers
 
-# Action limit for clamping: critically, assumes all dimensions share the same bound!
-act_limit = args.n_servers
+hidden_dim = 256
 
-# initialize a PPO agent
-td3_agent = TD3(state_dim, action_dim, lr_actor, lr_critic, gamma, K_epochs, eps_clip, action_std)
+value_net1 = ValueNetwork(state_dim, action_dim, hidden_dim).to(device)
+value_net2 = ValueNetwork(state_dim, action_dim, hidden_dim).to(device)
+policy_net = PolicyNetwork(state_dim, action_dim, hidden_dim).to(device)
+
+target_value_net1 = ValueNetwork(state_dim, action_dim, hidden_dim).to(device)
+target_value_net2 = ValueNetwork(state_dim, action_dim, hidden_dim).to(device)
+target_policy_net = PolicyNetwork(state_dim, action_dim, hidden_dim).to(device)
+
+soft_update(value_net1, target_value_net1, soft_tau=1.0)
+soft_update(value_net2, target_value_net2, soft_tau=1.0)
+soft_update(policy_net, target_policy_net, soft_tau=1.0)
+
+value_optimizer1 = optim.Adam(value_net1.parameters(), lr=lr_critic)
+value_optimizer2 = optim.Adam(value_net2.parameters(), lr=lr_critic)
+policy_optimizer = optim.Adam(policy_net.parameters(), lr=lr_actor)
+
+replay_buffer = ReplayBuffer(replay_buffer_size)
+
+torch.manual_seed(0)
 # preTrained weights directory
 random_seed = 0             #### set this to load a particular checkpoint trained on random seed
 run_num_pretrained = 0      #### set this to load a particular checkpoint num
 directory = "TD3_preTrained" + '/' + 'resource_allocation' + '/' 
 checkpoint_path = directory + "TD3256_{}_{}_{}.pth".format('resource_allocation', random_seed, run_num_pretrained)
 print("loading network from : " + checkpoint_path)
-td3_agent.load(checkpoint_path)
-state = env.reset()
-print("--------------------------------------------------------------------------------------------")
+# load(policy_net, value_net1, value_net2, checkpoint_path)
 
+max_ep_len = 100            # max timesteps in one episode, previously 225
+
+env = Env()
+state = env.reset()
 
 class learn_td3(object):
     
     def __init__(self):
         self.name = 'TD3'
-
+        
     def step(self, obs):
         state = obs
         done = False
+        total_reward = 0
         for t in range(1, max_ep_len+1):
-            action = td3_agent.select_action(state)
-            state, reward, done, _ = env.step(action)
+            state = torch.FloatTensor(state).unsqueeze(0).to(device)
+            
+            action_tens = policy_net.get_action(state)
+            normalized_actions = NormalizedActions()
+            action = normalized_actions._action(action_tens)
+            action = int(action.item())
+            next_state, reward, done, _ = env.step(action)
+            state = next_state
+            total_reward += reward
             if done:
                 break
-        # clear buffer    
-        td3_agent.buffer.clear()
-
-        print("============================================================================================")
-        
+    
         return action
