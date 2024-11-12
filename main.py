@@ -43,8 +43,7 @@ def get_args():
     parser.add_argument('--rew-norm', type=int, default=0)
     # parser.add_argument(
     #     '--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
-    parser.add_argument(
-        '--device', type=str, default='cuda:0')
+    parser.add_argument('--device', type=str, default='cpu')
     parser.add_argument('--resume-path', type=str, default=None)
     parser.add_argument('--watch', action='store_true', default=False)
     parser.add_argument('--lr-decay', action='store_true', default=False)
@@ -103,6 +102,7 @@ def main(args=get_args()):
         n_timesteps=args.n_timesteps,
         bc_coef = args.bc_coef
     ).to(args.device)
+
     actor_optim = torch.optim.AdamW(
         actor.parameters(),
         lr=args.actor_lr,
