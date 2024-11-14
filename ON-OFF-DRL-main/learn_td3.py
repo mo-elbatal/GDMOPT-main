@@ -49,14 +49,14 @@ class ReplayBuffer:
         return len(self.buffer)
     
 class NormalizedActions:
-    def _action(self, action_probs):
+    def _action(self, action_prob):
         low  = 0
         high = action_dim-1
-        action_dist = torch.distributions.Categorical(probs=action_probs)
-        action = action_dist.sample()
-        action = low + (action + 1.0) * 0.5 * (high - low)
-        action = np.clip(action, low, high)
-        
+        # Discrete Substitute
+        # action_dist = torch.distributions.Categorical(probs=action_probs)
+        # action = action_dist.sample()
+        action = low + (action_prob + 1.0) * 0.5 * (high - low)
+        action = torch.clamp(action, min=low, max=high)
         return action
 
     def _reverse_action(self, action_tens):
@@ -68,19 +68,18 @@ class NormalizedActions:
         
         return action
 
-# used with continuous action space
-# class GaussianExploration(object):
-#     def __init__(self, max_sigma=1.0, min_sigma=1.0, decay_period=1000000):
-#         self.low  = 0
-#         self.high = action_dim
-#         self.max_sigma = max_sigma
-#         self.min_sigma = min_sigma
-#         self.decay_period = decay_period
+class GaussianExploration(object):
+    def __init__(self, max_sigma=1.0, min_sigma=1.0, decay_period=1000000):
+        self.low  = 0
+        self.high = action_dim
+        self.max_sigma = max_sigma
+        self.min_sigma = min_sigma
+        self.decay_period = decay_period
     
-#     def get_action(self, action, t=0):
-#         sigma  = self.max_sigma - (self.max_sigma - self.min_sigma) * min(1.0, t / self.decay_period)
-#         action = action + np.random.normal(size=len(action)) * sigma
-#         return np.clip(action, self.low, self.high)
+    def get_action(self, action, t=0):
+        sigma  = self.max_sigma - (self.max_sigma - self.min_sigma) * min(1.0, t / self.decay_period)
+        action = action + np.random.normal(size=len(action)) * sigma
+        return np.clip(action, self.low, self.high)
 
 def soft_update(net, target_net, soft_tau=1e-2):
     for target_param, param in zip(target_net.parameters(), net.parameters()):
@@ -100,29 +99,32 @@ class PolicyNetwork(nn.Module):
     def forward(self, state):
         x = F.relu(self.linear1(state))
         x = F.relu(self.linear2(x))
-        x = F.relu(self.linear3(x))
-        # x = tanh(self.linear3(x)  # tanh function used for continuous-action space values [-1, 1] - interferes with probs
-        x = self.softmax(x)
+        x = F.tanh(self.linear3(x))  # tanh function used for continuous-action space values [-1, 1] - interferes with probs
+        # x = F.relu(self.linear3(x)) # Discrete Substitute
+        # x = self.softmax(x)
         return x
     
     def get_action(self, state):
-        state  = torch.FloatTensor(state).unsqueeze(0).to(device)
+        state = torch.FloatTensor(state).unsqueeze(0).to(device)
         action = self.forward(state)
-        return action
+        return action.detach()
         # return action.detach().cpu().numpy()[0]
 
 class ValueNetwork(nn.Module):
-    def __init__(self, num_inputs, num_actions, hidden_size):
+    def __init__(self, state_dim, action_dim, hidden_size):
         super(ValueNetwork, self).__init__()
         
-        self.linear1 = nn.Linear(num_inputs + num_actions, hidden_size)
+        self.linear1 = nn.Linear(state_dim + action_dim, hidden_size)
         self.linear2 = nn.Linear(hidden_size, hidden_size)
         self.linear3 = nn.Linear(hidden_size, 1)
         
     def forward(self, state, action):
-        action = F.one_hot(action, num_classes=action_dim).float()  # One-hot encode the action
-        action = action.view(state.size(0), -1) # Reshape to (batch_size, action_dim)
-        x = torch.cat([state, action], 1)
+        if len(action.shape) == 1:
+            action = action.view(-1, 1)
+        if action.shape[1] == 1:
+            action = F.one_hot(action.long(), num_classes=self.linear1.in_features - state.shape[1]).float()
+            action = action.view(state.size(0), -1)  # Reshape to [batch_size, action_dim]
+        x = torch.cat([state, action], dim=1)
         x = F.relu(self.linear1(x))
         x = F.relu(self.linear2(x))
         x = self.linear3(x)
@@ -141,28 +143,36 @@ def td3_update(step,
     # Convert all to tensors and move to device
     state = torch.FloatTensor(state).to(device)
     next_state = torch.FloatTensor(next_state).to(device)
-    action = torch.LongTensor(action).to(device)  # For discrete actions, use LongTensor
+    action = torch.FloatTensor(action).to(device)  # For discrete actions, use LongTensor
     reward = torch.FloatTensor(reward).squeeze(1).to(device)
     done = torch.FloatTensor(np.float32(done)).unsqueeze(1).to(device)
 
-    # Policy network predicts probabilities for each action
-    next_action_probs = target_policy_net(next_state)
-    next_action_dist = torch.distributions.Categorical(probs=next_action_probs)
-    next_action = next_action_dist.sample()
+    # Discrete Substitute
+    # # Policy network predicts probabilities for each action
+    # next_action_probs = target_policy_net(next_state)
+    # next_action_dist = torch.distributions.Categorical(probs=next_action_probs)
+    # next_action = next_action_dist.sample()
 
-    # Add noise to target actions for exploration, clipped within limits
-    noise = torch.normal(0, noise_std, size=next_action.shape).to(device)
+    # # Add noise to target actions for exploration, clipped within limits
+    # noise = torch.normal(0, noise_std, size=next_action.shape).to(device)
+    # noise = torch.clamp(noise, -noise_clip, noise_clip)
+    # next_action = torch.clamp(next_action + noise, 0, action_dim - 1).long()
+
+    next_action = target_policy_net(next_state)
+    noise = torch.normal(torch.zeros(next_action.size()), noise_std).to(device)
     noise = torch.clamp(noise, -noise_clip, noise_clip)
-    next_action = torch.clamp(next_action + noise, 0, action_dim - 1).long()
+    next_action += noise
+    next_action = normalized_actions._action(next_action)
 
     # Get Q-value estimates from target networks, selecting based on `next_action`
 
     target_q_value1 = target_value_net1(next_state, next_action)
     target_q_value2 = target_value_net2(next_state, next_action)
     target_q_value = torch.min(target_q_value1, target_q_value2)
-    
+
     # Calculate the expected Q-value
     expected_q_value = reward + (1.0 - done) * gamma * target_q_value
+
 
     # Calculate Q-values for the current state and chosen action
     q_value1 = value_net1(state, action)
@@ -188,9 +198,9 @@ def td3_update(step,
     # Policy update at intervals
     if step % policy_update == 0:
         # Compute policy loss using action values from value_net1
-        action_probs = policy_net(state)
-        action_dist = torch.distributions.Categorical(probs=action_probs)
-        chosen_action = action_dist.sample()
+        # action_probs = policy_net(state)
+        # action_dist = torch.distributions.Categorical(probs=action_probs)
+        # chosen_action = action_dist.sample()
         
         policy_loss = -value_net1(state, action).mean()
 
@@ -205,7 +215,6 @@ def td3_update(step,
         soft_update(policy_net, target_policy_net, soft_tau=soft_tau)
     
     return target_q_value, expected_q_value
-
     
 def load(policy_net, value_net1, value_net2, checkpoint_path):
     policy_net.load_state_dict(torch.load(checkpoint_path, map_location=lambda storage, loc: storage))
@@ -228,6 +237,8 @@ state_dim = args.n_servers * args.n_resources + args.n_resources + 1
 action_dim = args.n_servers
 
 hidden_dim = 256
+
+normalized_actions = NormalizedActions()
 
 value_net1 = ValueNetwork(state_dim, action_dim, hidden_dim).to(device)
 value_net2 = ValueNetwork(state_dim, action_dim, hidden_dim).to(device)
@@ -256,9 +267,11 @@ checkpoint_path = directory + "TD3256_{}_{}_{}.pth".format('resource_allocation'
 print("loading network from : " + checkpoint_path)
 # load(policy_net, value_net1, value_net2, checkpoint_path)
 
-max_ep_len = 100            # max timesteps in one episode, previously 225
+max_ep_len = 225            # max timesteps in one episode, also try 100
 
 env = Env()
+noise = GaussianExploration()
+
 state = env.reset()
 
 class learn_td3(object):
@@ -270,13 +283,12 @@ class learn_td3(object):
         state = obs
         done = False
         total_reward = 0
-        for t in range(1, max_ep_len+1):
+        for step in range(1, max_ep_len+1):
             state = torch.FloatTensor(state).unsqueeze(0).to(device)
-            
             action_tens = policy_net.get_action(state)
-            normalized_actions = NormalizedActions()
-            action = normalized_actions._action(action_tens)
-            action = int(action.item())
+            action_tens = noise.get_action(action_tens, step)
+            action_tens = normalized_actions._action(action_tens)
+            action = action_tens.multinomial(1)
             next_state, reward, done, _ = env.step(action)
             state = next_state
             total_reward += reward

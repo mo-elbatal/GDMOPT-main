@@ -47,6 +47,50 @@ class ReplayBuffer:
     
     def __len__(self):
         return len(self.buffer)
+
+class PrioritizedReplayBuffer:
+    def __init__(self, capacity, alpha=0.6):
+        self.capacity = capacity
+        self.alpha = alpha
+        self.buffer = deque(maxlen=capacity)
+        self.priorities = deque(maxlen=capacity)
+        self.position = 0
+
+    def add(self, transition, error):
+        # Calculate priority
+        priority = (error + 1e-5) ** self.alpha  # Small epsilon to avoid zero priority
+        if len(self.buffer) < self.capacity:
+            self.buffer.append(transition)
+            self.priorities.append(priority)
+        else:
+            self.buffer[self.position] = transition
+            self.priorities[self.position] = priority
+        self.position = (self.position + 1) % self.capacity
+
+    def sample(self, batch_size, beta=0.4):
+        # Calculate sampling probabilities
+        priorities = np.array(self.priorities)
+        probabilities = priorities / priorities.sum()
+
+        # Sample indices based on probabilities
+        indices = np.random.choice(len(self.buffer), batch_size, p=probabilities)
+        samples = [self.buffer[idx] for idx in indices]
+
+        # Importance-sampling weights
+        weights = (len(self.buffer) * probabilities[indices]) ** (-beta)
+        weights = weights / weights.max()
+        weights = torch.tensor(weights, dtype=torch.float32)
+
+        # Return sampled transitions and weights for each sample
+        batch = Transition(*zip(*samples))
+        return batch, weights, indices
+
+    def update_priorities(self, indices, errors):
+        for idx, error in zip(indices, errors):
+            self.priorities[idx] = (error + 1e-5) ** self.alpha
+
+    def __len__(self):
+        return len(self.buffer)
     
 class NormalizedActions:
     def _action(self, action_prob):
@@ -56,7 +100,7 @@ class NormalizedActions:
         # action_dist = torch.distributions.Categorical(probs=action_probs)
         # action = action_dist.sample()
         action = low + (action_prob + 1.0) * 0.5 * (high - low)
-        action = np.clip(action, low, high)
+        action = torch.clamp(action, min=low, max=high)
         return action
 
     def _reverse_action(self, action_tens):
@@ -68,6 +112,26 @@ class NormalizedActions:
         
         return action
 
+
+class OrnsteinUhlenbeckNoise:
+    def __init__(self, size, mu=0.0, theta=0.15, sigma=0.2, dt=1e-2):
+        self.mu = mu
+        self.theta = theta
+        self.sigma = sigma
+        self.dt = dt
+        self.size = size
+        self.reset()
+
+    def reset(self):
+        """Resets the noise to its initial state (mu)."""
+        self.state = np.ones(self.size) * self.mu
+
+    def sample(self):
+        """Generates a sample of Ornstein-Uhlenbeck noise."""
+        dx = self.theta * (self.mu - self.state) * self.dt + self.sigma * np.sqrt(self.dt) * np.random.normal(size=self.size)
+        self.state = self.state + dx
+        return self.state
+    
 class GaussianExploration(object):
     def __init__(self, max_sigma=1.0, min_sigma=1.0, decay_period=1000000):
         self.low  = 0
@@ -99,10 +163,9 @@ class PolicyNetwork(nn.Module):
     def forward(self, state):
         x = F.relu(self.linear1(state))
         x = F.relu(self.linear2(x))
-        x = F.tanh(self.linear3(x))  # tanh function used for continuous-action space values [-1, 1] - interferes with probs
-        # x = F.relu(self.linear3(x)) # Discrete Substitute
-        # x = self.softmax(x)
-        return x
+        # x = F.tanh(self.linear3(x))
+        action_probs = F.softmax(self.output(x), dim=-1)     
+        return action_probs
     
     def get_action(self, state):
         state = torch.FloatTensor(state).unsqueeze(0).to(device)
@@ -119,9 +182,12 @@ class ValueNetwork(nn.Module):
         self.linear3 = nn.Linear(hidden_size, 1)
         
     def forward(self, state, action):
-        action = F.one_hot(action, num_classes=action_dim).int()  # One-hot encode the action
-        action = action.view(state.size(0), -1) # Reshape to (batch_size, action_dim)
-        x = torch.cat([state, action], 1)
+        if len(action.shape) == 1:
+            action = action.view(-1, 1)
+        if action.shape[1] == 1:
+            action = F.one_hot(action.long(), num_classes=self.linear1.in_features - state.shape[1]).float()
+            action = action.view(state.size(0), -1)  # Reshape to [batch_size, action_dim]
+        x = torch.cat([state, action], dim=1)
         x = F.relu(self.linear1(x))
         x = F.relu(self.linear2(x))
         x = self.linear3(x)
@@ -159,18 +225,17 @@ def td3_update(step,
     noise = torch.normal(torch.zeros(next_action.size()), noise_std).to(device)
     noise = torch.clamp(noise, -noise_clip, noise_clip)
     next_action += noise
+    next_action = normalized_actions._action(next_action)
 
     # Get Q-value estimates from target networks, selecting based on `next_action`
 
     target_q_value1 = target_value_net1(next_state, next_action)
     target_q_value2 = target_value_net2(next_state, next_action)
     target_q_value = torch.min(target_q_value1, target_q_value2)
-    
+
     # Calculate the expected Q-value
     expected_q_value = reward + (1.0 - done) * gamma * target_q_value
 
-    print("target_q_value is ", target_q_value)
-    print("expected_q_value is", expected_q_value)
 
     # Calculate Q-values for the current state and chosen action
     q_value1 = value_net1(state, action)
@@ -226,7 +291,7 @@ replay_buffer_size = 1000000
 lr_actor = 0.0003       # learning rate for actor network
 lr_critic = 0.001       # learning rate for critic network
 max_training_timesteps = 100000   # break from training loop if timeteps > max_training_timesteps
-max_ep_len = 100            # max timesteps in one episode, previously 225
+max_ep_len = 225            # max timesteps in one episode, also try 100
 rewards     = []
 batch_size  = 128
 random_seed = 0      
@@ -249,6 +314,8 @@ action_dim = args.n_servers
 
 hidden_dim = 256
 
+normalized_actions = NormalizedActions()
+
 value_net1 = ValueNetwork(state_dim, action_dim, hidden_dim).to(device)
 value_net2 = ValueNetwork(state_dim, action_dim, hidden_dim).to(device)
 policy_net = PolicyNetwork(state_dim, action_dim, hidden_dim).to(device)
@@ -262,8 +329,8 @@ soft_update(value_net2, target_value_net2, soft_tau=1.0)
 soft_update(policy_net, target_policy_net, soft_tau=1.0)
 
 env = Env()
-noise = GaussianExploration() # for continuous action spaces
-
+# noise = GaussianExploration()
+noise = OrnsteinUhlenbeckNoise()
 ## Note : print/save frequencies should be > than max_ep_len
 
 ###################### saving files ######################
@@ -362,7 +429,8 @@ value_optimizer1 = optim.Adam(value_net1.parameters(), lr=lr_critic)
 value_optimizer2 = optim.Adam(value_net2.parameters(), lr=lr_critic)
 policy_optimizer = optim.Adam(policy_net.parameters(), lr=lr_actor)
 
-replay_buffer = ReplayBuffer(replay_buffer_size)
+replay_buffer = PrioritizedReplayBuffer(capacity=replay_buffer_size)
+# replay_buffer = ReplayBuffer(replay_buffer_size)
 
 start_time = datetime.now().replace(microsecond=0)
 print("Started training at (GMT) : ", start_time)
@@ -405,13 +473,9 @@ while time_step <= max_training_timesteps:
 
     for step in range(max_ep_len):
         action_tens = policy_net.get_action(state)
-        # print("action_tens", action_tens)
         action_tens = noise.get_action(action_tens, step)
-        # print("action_tens", action_tens)
-        normalized_actions = NormalizedActions()
         action_tens = normalized_actions._action(action_tens)
         action = action_tens.multinomial(1)
-        # print("action ", action)
         next_state, reward, done, _ = env.step(action)
         
         current_ep_reward += reward
