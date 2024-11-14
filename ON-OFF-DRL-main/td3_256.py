@@ -49,12 +49,13 @@ class ReplayBuffer:
         return len(self.buffer)
     
 class NormalizedActions:
-    def _action(self, action_probs):
+    def _action(self, action_prob):
         low  = 0
         high = action_dim-1
-        action_dist = torch.distributions.Categorical(probs=action_probs)
-        action = action_dist.sample()
-        action = low + (action + 1.0) * 0.5 * (high - low)
+        # Discrete Substitute
+        # action_dist = torch.distributions.Categorical(probs=action_probs)
+        # action = action_dist.sample()
+        action = low + (action_prob + 1.0) * 0.5 * (high - low)
         action = np.clip(action, low, high)
         return action
 
@@ -67,19 +68,18 @@ class NormalizedActions:
         
         return action
 
-# used with continuous action space
-# class GaussianExploration(object):
-#     def __init__(self, max_sigma=1.0, min_sigma=1.0, decay_period=1000000):
-#         self.low  = 0
-#         self.high = action_dim
-#         self.max_sigma = max_sigma
-#         self.min_sigma = min_sigma
-#         self.decay_period = decay_period
+class GaussianExploration(object):
+    def __init__(self, max_sigma=1.0, min_sigma=1.0, decay_period=1000000):
+        self.low  = 0
+        self.high = action_dim
+        self.max_sigma = max_sigma
+        self.min_sigma = min_sigma
+        self.decay_period = decay_period
     
-#     def get_action(self, action, t=0):
-#         sigma  = self.max_sigma - (self.max_sigma - self.min_sigma) * min(1.0, t / self.decay_period)
-#         action = action + np.random.normal(size=len(action)) * sigma
-#         return np.clip(action, self.low, self.high)
+    def get_action(self, action, t=0):
+        sigma  = self.max_sigma - (self.max_sigma - self.min_sigma) * min(1.0, t / self.decay_period)
+        action = action + np.random.normal(size=len(action)) * sigma
+        return np.clip(action, self.low, self.high)
 
 def soft_update(net, target_net, soft_tau=1e-2):
     for target_param, param in zip(target_net.parameters(), net.parameters()):
@@ -99,27 +99,27 @@ class PolicyNetwork(nn.Module):
     def forward(self, state):
         x = F.relu(self.linear1(state))
         x = F.relu(self.linear2(x))
-        x = F.relu(self.linear3(x))
-        # x = tanh(self.linear3(x)  # tanh function used for continuous-action space values [-1, 1] - interferes with probs
-        x = self.softmax(x)
+        x = F.tanh(self.linear3(x))  # tanh function used for continuous-action space values [-1, 1] - interferes with probs
+        # x = F.relu(self.linear3(x)) # Discrete Substitute
+        # x = self.softmax(x)
         return x
     
     def get_action(self, state):
-        state  = torch.FloatTensor(state).unsqueeze(0).to(device)
-        action  = self.forward(state)
-        return action
+        state = torch.FloatTensor(state).unsqueeze(0).to(device)
+        action = self.forward(state)
+        return action.detach()
         # return action.detach().cpu().numpy()[0]
 
 class ValueNetwork(nn.Module):
-    def __init__(self, num_inputs, num_actions, hidden_size):
+    def __init__(self, state_dim, action_dim, hidden_size):
         super(ValueNetwork, self).__init__()
         
-        self.linear1 = nn.Linear(num_inputs + num_actions, hidden_size)
+        self.linear1 = nn.Linear(state_dim + action_dim, hidden_size)
         self.linear2 = nn.Linear(hidden_size, hidden_size)
         self.linear3 = nn.Linear(hidden_size, 1)
         
     def forward(self, state, action):
-        action = F.one_hot(action, num_classes=action_dim).float()  # One-hot encode the action
+        action = F.one_hot(action, num_classes=action_dim).int()  # One-hot encode the action
         action = action.view(state.size(0), -1) # Reshape to (batch_size, action_dim)
         x = torch.cat([state, action], 1)
         x = F.relu(self.linear1(x))
@@ -140,19 +140,25 @@ def td3_update(step,
     # Convert all to tensors and move to device
     state = torch.FloatTensor(state).to(device)
     next_state = torch.FloatTensor(next_state).to(device)
-    action = torch.LongTensor(action).to(device)  # For discrete actions, use LongTensor
+    action = torch.FloatTensor(action).to(device)  # For discrete actions, use LongTensor
     reward = torch.FloatTensor(reward).squeeze(1).to(device)
     done = torch.FloatTensor(np.float32(done)).unsqueeze(1).to(device)
 
-    # Policy network predicts probabilities for each action
-    next_action_probs = target_policy_net(next_state)
-    next_action_dist = torch.distributions.Categorical(probs=next_action_probs)
-    next_action = next_action_dist.sample()
+    # Discrete Substitute
+    # # Policy network predicts probabilities for each action
+    # next_action_probs = target_policy_net(next_state)
+    # next_action_dist = torch.distributions.Categorical(probs=next_action_probs)
+    # next_action = next_action_dist.sample()
 
-    # Add noise to target actions for exploration, clipped within limits
-    noise = torch.normal(0, noise_std, size=next_action.shape).to(device)
+    # # Add noise to target actions for exploration, clipped within limits
+    # noise = torch.normal(0, noise_std, size=next_action.shape).to(device)
+    # noise = torch.clamp(noise, -noise_clip, noise_clip)
+    # next_action = torch.clamp(next_action + noise, 0, action_dim - 1).long()
+
+    next_action = target_policy_net(next_state)
+    noise = torch.normal(torch.zeros(next_action.size()), noise_std).to(device)
     noise = torch.clamp(noise, -noise_clip, noise_clip)
-    next_action = torch.clamp(next_action + noise, 0, action_dim - 1).long()
+    next_action += noise
 
     # Get Q-value estimates from target networks, selecting based on `next_action`
 
@@ -162,6 +168,9 @@ def td3_update(step,
     
     # Calculate the expected Q-value
     expected_q_value = reward + (1.0 - done) * gamma * target_q_value
+
+    print("target_q_value is ", target_q_value)
+    print("expected_q_value is", expected_q_value)
 
     # Calculate Q-values for the current state and chosen action
     q_value1 = value_net1(state, action)
@@ -187,9 +196,9 @@ def td3_update(step,
     # Policy update at intervals
     if step % policy_update == 0:
         # Compute policy loss using action values from value_net1
-        action_probs = policy_net(state)
-        action_dist = torch.distributions.Categorical(probs=action_probs)
-        chosen_action = action_dist.sample()
+        # action_probs = policy_net(state)
+        # action_dist = torch.distributions.Categorical(probs=action_probs)
+        # chosen_action = action_dist.sample()
         
         policy_loss = -value_net1(state, action).mean()
 
@@ -230,8 +239,7 @@ log_freq = max_ep_len * 2       # saving avg reward in the interval (in num time
 save_model_freq = max_ep_len * 4         # save model frequency (in num timesteps)
 capacity = 10000
 
-env = Env()
-# noise = GaussianExploration() # for continuous action spaces
+
 
 # state space dimension
 state_dim = args.n_servers * args.n_resources + args.n_resources + 1
@@ -252,6 +260,9 @@ target_policy_net = PolicyNetwork(state_dim, action_dim, hidden_dim).to(device)
 soft_update(value_net1, target_value_net1, soft_tau=1.0)
 soft_update(value_net2, target_value_net2, soft_tau=1.0)
 soft_update(policy_net, target_policy_net, soft_tau=1.0)
+
+env = Env()
+noise = GaussianExploration() # for continuous action spaces
 
 ## Note : print/save frequencies should be > than max_ep_len
 
@@ -394,9 +405,13 @@ while time_step <= max_training_timesteps:
 
     for step in range(max_ep_len):
         action_tens = policy_net.get_action(state)
+        # print("action_tens", action_tens)
+        action_tens = noise.get_action(action_tens, step)
+        # print("action_tens", action_tens)
         normalized_actions = NormalizedActions()
-        action = normalized_actions._action(action_tens) + np.random.normal(0, 0.1)
-        action = int(np.clip(action, 0, action_dim - 1))
+        action_tens = normalized_actions._action(action_tens)
+        action = action_tens.multinomial(1)
+        # print("action ", action)
         next_state, reward, done, _ = env.step(action)
         
         current_ep_reward += reward
