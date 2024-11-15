@@ -1,6 +1,7 @@
 import os
 from datetime import datetime
 from collections import deque
+from collections import namedtuple
 import random
 import numpy as np
 import torch
@@ -28,25 +29,6 @@ else:
     
 print("============================================================================================")
 
-class ReplayBuffer:
-    def __init__(self, capacity):
-        self.capacity = capacity
-        self.buffer = []
-        self.position = 0
-    
-    def push(self, state, action, reward, next_state, done):
-        if len(self.buffer) < self.capacity:
-            self.buffer.append(None)
-        self.buffer[self.position] = (state, action, reward, next_state, done)
-        self.position = (self.position + 1) % self.capacity
-    
-    def sample(self, batch_size):
-        batch = random.sample(self.buffer, batch_size)
-        state, action, reward, next_state, done = map(np.stack, zip(*batch))
-        return state, action.squeeze(), reward, next_state, done
-    
-    def __len__(self):
-        return len(self.buffer)
 
 class PrioritizedReplayBuffer:
     def __init__(self, capacity, alpha=0.6):
@@ -57,32 +39,59 @@ class PrioritizedReplayBuffer:
         self.position = 0
 
     def add(self, transition, error):
-        # Calculate priority
-        priority = (error + 1e-5) ** self.alpha  # Small epsilon to avoid zero priority
-        if len(self.buffer) < self.capacity:
-            self.buffer.append(transition)
-            self.priorities.append(priority)
-        else:
-            self.buffer[self.position] = transition
-            self.priorities[self.position] = priority
-        self.position = (self.position + 1) % self.capacity
+        # Unpack the transition
+        state, action, reward, next_state, done = transition
+
+        # Convert to NumPy arrays if needed
+        if not isinstance(state, np.ndarray):
+            state = state.cpu().numpy()
+        
+        if not isinstance(next_state, np.ndarray):
+            next_state = next_state.cpu().numpy()
+
+        # Recreate the transition with validated data
+        transition = (state, action, reward, next_state, done)
+
+        # Add to buffer
+        priority = float((error + 1e-5) ** self.alpha)
+        self.buffer.append(transition)
+        self.priorities.append(priority)
 
     def sample(self, batch_size, beta=0.4):
-        # Calculate sampling probabilities
-        priorities = np.array(self.priorities)
-        probabilities = priorities / priorities.sum()
+        # Ensure all priorities are scalar before conversion
+        if not all(isinstance(p, (int, float)) for p in self.priorities):
+            # print("Non-scalar values detected in priorities. Cleaning...")
+            self.priorities = deque(float(p[0]) if isinstance(p, (list, np.ndarray)) else float(p) for p in self.priorities)
 
-        # Sample indices based on probabilities
+        # Convert to NumPy array
+        priorities = np.array(self.priorities)
+        if priorities.ndim != 1:
+            raise ValueError(f"Invalid priorities shape: {priorities.shape}. Expected a 1D array.")
+
+        # Calculate probabilities for sampling
+        probabilities = priorities / priorities.sum()
         indices = np.random.choice(len(self.buffer), batch_size, p=probabilities)
         samples = [self.buffer[idx] for idx in indices]
 
-        # Importance-sampling weights
+        # Extract components of the sampled transitions
+        states, actions, rewards, next_states, dones = zip(*samples)
+
+        # Convert states and next_states to tensors
+        states = np.vstack(states)  # Stacks all states into a single NumPy array
+        states = torch.FloatTensor(states).to(device)
+
+        next_states = np.vstack(next_states)
+        next_states = torch.FloatTensor(next_states).to(device)
+
+        # Calculate importance-sampling weights
         weights = (len(self.buffer) * probabilities[indices]) ** (-beta)
-        weights = weights / weights.max()
+        weights /= weights.max()
         weights = torch.tensor(weights, dtype=torch.float32)
 
-        # Return sampled transitions and weights for each sample
-        batch = Transition(*zip(*samples))
+        # Create a named tuple for the batch
+        Transition = namedtuple('Transition', ('state', 'action', 'reward', 'next_state', 'done'))
+        batch = Transition(states, actions, rewards, next_states, dones)
+
         return batch, weights, indices
 
     def update_priorities(self, indices, errors):
@@ -91,59 +100,62 @@ class PrioritizedReplayBuffer:
 
     def __len__(self):
         return len(self.buffer)
-    
+
+
 class NormalizedActions:
+    def __init__(self, action_dim):
+        self.action_dim = action_dim
+        self.low = 0
+        self.high = action_dim - 1
+
     def _action(self, action_prob):
-        low  = 0
-        high = action_dim-1
-        # Discrete Substitute
-        # action_dist = torch.distributions.Categorical(probs=action_probs)
-        # action = action_dist.sample()
-        action = low + (action_prob + 1.0) * 0.5 * (high - low)
-        action = torch.clamp(action, min=low, max=high)
+        action = self.low + (action_prob + 1.0) * 0.5 * (self.high - self.low)
+        action = torch.clamp(action, min=self.low, max=self.high)
         return action
 
     def _reverse_action(self, action_tens):
-        low  = 0
-        high = action_dim-1
-        action = action_tens.multinomial(1)
-        action = 2 * (action - low) / (high - low) - 1
-        action = np.clip(action, low, high)
-        
+        action = action_tens.argmax(dim=-1)
+        action = 2 * (action - self.low) / (self.high - self.low) - 1
+        action = torch.clamp(action, self.low, self.high)
         return action
 
 
-class OrnsteinUhlenbeckNoise:
-    def __init__(self, size, mu=0.0, theta=0.15, sigma=0.2, dt=1e-2):
+class OrnsteinUhlenbeckNoise(object):
+    def __init__(self, action_dim, mu=0.0, theta=0.15, sigma=0.2, dt=1e-2, decay_period=1000000):
+        self.action_dim = action_dim
         self.mu = mu
         self.theta = theta
         self.sigma = sigma
         self.dt = dt
-        self.size = size
-        self.reset()
+        self.decay_period = decay_period
+        self.state = np.ones(self.action_dim) * self.mu
 
     def reset(self):
-        """Resets the noise to its initial state (mu)."""
-        self.state = np.ones(self.size) * self.mu
+        self.state = np.ones(self.action_dim) * self.mu
 
-    def sample(self):
-        """Generates a sample of Ornstein-Uhlenbeck noise."""
-        dx = self.theta * (self.mu - self.state) * self.dt + self.sigma * np.sqrt(self.dt) * np.random.normal(size=self.size)
-        self.state = self.state + dx
-        return self.state
-    
-class GaussianExploration(object):
-    def __init__(self, max_sigma=1.0, min_sigma=1.0, decay_period=1000000):
-        self.low  = 0
-        self.high = action_dim
-        self.max_sigma = max_sigma
-        self.min_sigma = min_sigma
-        self.decay_period = decay_period
-    
     def get_action(self, action, t=0):
-        sigma  = self.max_sigma - (self.max_sigma - self.min_sigma) * min(1.0, t / self.decay_period)
-        action = action + np.random.normal(size=len(action)) * sigma
-        return np.clip(action, self.low, self.high)
+        sigma = self.sigma - (self.sigma) * min(1.0, t / self.decay_period)
+        # Applying the Ornstein-Uhlenbeck process
+        dx = self.theta * (self.mu - self.state) * self.dt + sigma * np.sqrt(self.dt) * np.random.normal(size=self.action_dim)
+        self.state = self.state + dx
+        action_with_noise = action + self.state
+        return action_with_noise
+
+def compute_td_errors(transitions):
+    states = transitions.state
+    actions = torch.cat(transitions.action, dim=0)
+    rewards = torch.cat(transitions.reward, dim=0).squeeze(1) 
+    next_states = transitions.next_state
+    dones = torch.tensor(transitions.done, dtype=torch.float32) 
+    with torch.no_grad():
+        next_actions = target_policy_net(next_states)
+        target_q_values = target_value_net1(next_states, next_actions)
+        target_q_values = rewards + (1 - dones) * gamma * target_q_values
+    
+    current_q_values = value_net1(states, actions)
+    td_errors = (target_q_values - current_q_values).abs()
+
+    return td_errors.cpu().detach().numpy()
 
 def soft_update(net, target_net, soft_tau=1e-2):
     for target_param, param in zip(target_net.parameters(), net.parameters()):
@@ -164,14 +176,12 @@ class PolicyNetwork(nn.Module):
         x = F.relu(self.linear1(state))
         x = F.relu(self.linear2(x))
         # x = F.tanh(self.linear3(x))
-        action_probs = F.softmax(self.output(x), dim=-1)     
+        action_probs = F.softmax(self.linear3(x), dim=-1)
         return action_probs
     
     def get_action(self, state):
-        state = torch.FloatTensor(state).unsqueeze(0).to(device)
         action = self.forward(state)
         return action.detach()
-        # return action.detach().cpu().numpy()[0]
 
 class ValueNetwork(nn.Module):
     def __init__(self, state_dim, action_dim, hidden_size):
@@ -182,74 +192,56 @@ class ValueNetwork(nn.Module):
         self.linear3 = nn.Linear(hidden_size, 1)
         
     def forward(self, state, action):
-        if len(action.shape) == 1:
-            action = action.view(-1, 1)
-        if action.shape[1] == 1:
-            action = F.one_hot(action.long(), num_classes=self.linear1.in_features - state.shape[1]).float()
+        if action.dim() == 1:
+            action = action.unsqueeze(1)
+
+        if action.shape[1] == 1: 
+            num_classes = self.linear1.in_features - state.shape[1]
+            action = F.one_hot(action.long(), num_classes=num_classes).float()
             action = action.view(state.size(0), -1)  # Reshape to [batch_size, action_dim]
+        
         x = torch.cat([state, action], dim=1)
+
         x = F.relu(self.linear1(x))
         x = F.relu(self.linear2(x))
         x = self.linear3(x)
+        
         return x.view(-1, 1)
 
-def td3_update(step,
-                batch_size,
-                gamma=0.99,
-                soft_tau=1e-2,
-                noise_std=0.2,
-                noise_clip=0.5,
-                policy_update=2):
 
-    state, action, reward, next_state, done = replay_buffer.sample(batch_size)
+def td3_update(step, batch_size, gamma=0.99, soft_tau=1e-2, noise_std=0.2, noise_clip=0.3, policy_update=2, target_update = 10, beta=0.4):
 
-    # Convert all to tensors and move to device
+    batch, weights, indices = replay_buffer.sample(batch_size, beta)
+    state, action, reward, next_state, done = batch
+
+    # Validate and stack states
+    if isinstance(state, list):
+        state = np.stack(state)
+    
     state = torch.FloatTensor(state).to(device)
     next_state = torch.FloatTensor(next_state).to(device)
-    action = torch.FloatTensor(action).to(device)  # For discrete actions, use LongTensor
-    reward = torch.FloatTensor(reward).squeeze(1).to(device)
+    action = torch.FloatTensor(action).to(device)
+    reward = torch.FloatTensor(reward).to(device).view(-1, 1)
     done = torch.FloatTensor(np.float32(done)).unsqueeze(1).to(device)
+    weights = weights.to(device)
 
-    # Discrete Substitute
-    # # Policy network predicts probabilities for each action
-    # next_action_probs = target_policy_net(next_state)
-    # next_action_dist = torch.distributions.Categorical(probs=next_action_probs)
-    # next_action = next_action_dist.sample()
-
-    # # Add noise to target actions for exploration, clipped within limits
-    # noise = torch.normal(0, noise_std, size=next_action.shape).to(device)
-    # noise = torch.clamp(noise, -noise_clip, noise_clip)
-    # next_action = torch.clamp(next_action + noise, 0, action_dim - 1).long()
-
+    # Calculate next actions with target policy
     next_action = target_policy_net(next_state)
     noise = torch.normal(torch.zeros(next_action.size()), noise_std).to(device)
     noise = torch.clamp(noise, -noise_clip, noise_clip)
-    next_action += noise
-    next_action = normalized_actions._action(next_action)
+    next_action = normalized_actions._action(next_action + noise)
 
-    # Get Q-value estimates from target networks, selecting based on `next_action`
-
-    target_q_value1 = target_value_net1(next_state, next_action)
-    target_q_value2 = target_value_net2(next_state, next_action)
+    target_q_value1 = target_value_net1(next_state, next_action).view(-1, 1)
+    target_q_value2 = target_value_net2(next_state, next_action).view(-1, 1)
     target_q_value = torch.min(target_q_value1, target_q_value2)
-
-    # Calculate the expected Q-value
     expected_q_value = reward + (1.0 - done) * gamma * target_q_value
 
+    q_value1 = value_net1(state, action).view(-1, 1)
+    q_value2 = value_net2(state, action).view(-1, 1)
 
-    # Calculate Q-values for the current state and chosen action
-    q_value1 = value_net1(state, action)
-    q_value2 = value_net2(state, action)
+    value_loss1 = (weights * F.mse_loss(q_value1, expected_q_value.detach(), reduction='none').squeeze()).mean()
+    value_loss2 = (weights * F.mse_loss(q_value2, expected_q_value.detach(), reduction='none').squeeze()).mean()
 
-    q_value1 = q_value1.view(-1, 1)
-    q_value2 = q_value2.view(-1, 1)
-    expected_q_value = expected_q_value.view(-1, 1)
-
-    # Calculate losses for the value networks
-    value_loss1 = F.mse_loss(q_value1, expected_q_value.detach())
-    value_loss2 = F.mse_loss(q_value2, expected_q_value.detach())
-
-    # Optimize the value networks
     value_optimizer1.zero_grad()
     value_loss1.backward()
     value_optimizer1.step()
@@ -258,21 +250,17 @@ def td3_update(step,
     value_loss2.backward()
     value_optimizer2.step()
 
-    # Policy update at intervals
-    if step % policy_update == 0:
-        # Compute policy loss using action values from value_net1
-        # action_probs = policy_net(state)
-        # action_dist = torch.distributions.Categorical(probs=action_probs)
-        # chosen_action = action_dist.sample()
-        
-        policy_loss = -value_net1(state, action).mean()
+    # Update priorities
+    errors = torch.abs(q_value1 - expected_q_value).detach().cpu().numpy()
+    replay_buffer.update_priorities(indices, errors)
 
-        # Optimize the policy network
+    if step % policy_update == 0:
+        policy_loss = -value_net1(state, action).mean()
         policy_optimizer.zero_grad()
         policy_loss.backward()
         policy_optimizer.step()
 
-        # Soft update for target networks
+    if step % target_update == 0:
         soft_update(value_net1, target_value_net1, soft_tau=soft_tau)
         soft_update(value_net2, target_value_net2, soft_tau=soft_tau)
         soft_update(policy_net, target_policy_net, soft_tau=soft_tau)
@@ -298,12 +286,11 @@ random_seed = 0
 gamma = 0.99     
 decay_rate = 0.995
 epsilon = 1          
+beta_start = 0.4  # Initial value
 
 print_freq = max_ep_len * 4     # print avg reward in the interval (in num timesteps)
 log_freq = max_ep_len * 2       # saving avg reward in the interval (in num timesteps)
 save_model_freq = max_ep_len * 4         # save model frequency (in num timesteps)
-capacity = 10000
-
 
 
 # state space dimension
@@ -314,7 +301,7 @@ action_dim = args.n_servers
 
 hidden_dim = 256
 
-normalized_actions = NormalizedActions()
+normalized_actions = NormalizedActions(action_dim)
 
 value_net1 = ValueNetwork(state_dim, action_dim, hidden_dim).to(device)
 value_net2 = ValueNetwork(state_dim, action_dim, hidden_dim).to(device)
@@ -330,7 +317,7 @@ soft_update(policy_net, target_policy_net, soft_tau=1.0)
 
 env = Env()
 # noise = GaussianExploration()
-noise = OrnsteinUhlenbeckNoise()
+noise = OrnsteinUhlenbeckNoise(action_dim)
 ## Note : print/save frequencies should be > than max_ep_len
 
 ###################### saving files ######################
@@ -430,7 +417,6 @@ value_optimizer2 = optim.Adam(value_net2.parameters(), lr=lr_critic)
 policy_optimizer = optim.Adam(policy_net.parameters(), lr=lr_actor)
 
 replay_buffer = PrioritizedReplayBuffer(capacity=replay_buffer_size)
-# replay_buffer = ReplayBuffer(replay_buffer_size)
 
 start_time = datetime.now().replace(microsecond=0)
 print("Started training at (GMT) : ", start_time)
@@ -461,6 +447,7 @@ while time_step <= max_training_timesteps:
     print("New training episode:")
     sleep(0.1) # we sleep to read the reward in console
     state = env.reset()
+    state = torch.FloatTensor(state).unsqueeze(0).to(device)
     current_ep_reward = 0
     q_values = []
     values   = []
@@ -474,10 +461,18 @@ while time_step <= max_training_timesteps:
     for step in range(max_ep_len):
         action_tens = policy_net.get_action(state)
         action_tens = noise.get_action(action_tens, step)
-        action_tens = normalized_actions._action(action_tens)
-        action = action_tens.multinomial(1)
-        next_state, reward, done, _ = env.step(action)
-        
+        action_tens = normalized_actions._action(action_tens).float()
+        # Calculate initial TD error for priority
+        with torch.no_grad():
+            q_value = value_net1(state, action_tens)
+            action = action_tens.multinomial(1)
+            # action = torch.argmax(action_tens, dim=1)
+            next_state, reward, done, _ = env.step(action)
+            next_state = torch.FloatTensor(next_state).unsqueeze(0).to(device)
+            next_q_value = target_value_net1(next_state, target_policy_net(next_state))
+            td_error = abs(reward + gamma * next_q_value - q_value).item()
+
+        # sample for a single action
         current_ep_reward += reward
         time_step += 1
         print("The current total episodic reward at timestep:", time_step, "is:", current_ep_reward)
@@ -486,9 +481,14 @@ while time_step <= max_training_timesteps:
         reward = torch.FloatTensor([reward]).unsqueeze(1).to(device)
         mask   = torch.FloatTensor(1 - np.float32([done])).unsqueeze(1).to(device)
 
-        replay_buffer.push(state, action, reward, next_state, done)
+        # Store transition
+        replay_buffer.add((state, action, reward, next_state, done), error=td_error)
 
         if len(replay_buffer) > batch_size:
+            transitions, weights, indices = replay_buffer.sample(batch_size, beta=beta_start)
+            # After training, update priorities in replay buffer
+            new_errors = compute_td_errors(transitions)
+            replay_buffer.update_priorities(indices, new_errors)
             target_q_value, expected_q_value = td3_update(step, batch_size)
 
         q_values.append(target_q_value)
@@ -513,6 +513,10 @@ while time_step <= max_training_timesteps:
             sleep(0.1) # we sleep to read the reward in console
             log_running_reward = 0
             log_running_episodes = 0
+        
+        # if time_step % log_interval == 0:
+        #     avg_reward = np.mean(rewards[-log_interval:])
+        #     print(f"Step {time_step}, Average Reward: {avg_reward}")
             
         # printing average reward
         if time_step % print_freq == 0:
@@ -542,7 +546,7 @@ while time_step <= max_training_timesteps:
         if done:
             break
 
-    next_state = torch.FloatTensor(state).unsqueeze(0).to(device)
+    # next_state = torch.FloatTensor(state).unsqueeze(0).to(device)
     
     print_running_reward += current_ep_reward
     print_running_episodes += 1
@@ -560,4 +564,3 @@ log_f2.close()
 ################################ End of Part II ################################
 
 print("============================================================================================")
-

@@ -27,3 +27,5 @@ Things Journal, pages 1–1, 2020 (A3C algo.)
 
 In the paper On-policy vs off-policy, it assumed the propagation delay to be distance/speed. Is it correct?
 It placed the training model and inference model both in the non-RT-RIC instead of placing training model in near-RT-RIC
+
+Next: comparitive analysis of td3 plot, Generative AI for policy gen, system modelling, Meta Learning, Hybrid Learning, 
