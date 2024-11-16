@@ -317,7 +317,9 @@ while time_step <= max_training_timesteps:
         # select action with policy
         state = torch.FloatTensor(state).unsqueeze(0).to(device)
         policy, q_value, value = model(state)
+        print("policy", policy)
         action = policy.multinomial(1)
+        print("action", action)
         next_state, reward, done, info = env.step(action.item())
         time_step +=1
         current_ep_reward += reward

@@ -121,24 +121,26 @@ class NormalizedActions:
 
 
 class OrnsteinUhlenbeckNoise(object):
-    def __init__(self, action_dim, mu=0.0, theta=0.15, sigma=0.2, dt=1e-2, decay_period=1000000):
+    def __init__(self, action_dim, mu=0.0, theta=0.15, sigma=0.05, dt=1e-2, decay_period=1000000):
         self.action_dim = action_dim
         self.mu = mu
         self.theta = theta
         self.sigma = sigma
         self.dt = dt
-        self.decay_period = decay_period
+        self.decay_rate = 1.0/decay_period
         self.state = np.ones(self.action_dim) * self.mu
 
     def reset(self):
         self.state = np.ones(self.action_dim) * self.mu
 
     def get_action(self, action, t=0):
-        sigma = self.sigma - (self.sigma) * min(1.0, t / self.decay_period)
+        # sigma = self.sigma - (self.sigma) * min(1.0, t / self.decay_period)
+        sigma = max(0.01, self.sigma - self.decay_rate * t)
         # Applying the Ornstein-Uhlenbeck process
         dx = self.theta * (self.mu - self.state) * self.dt + sigma * np.sqrt(self.dt) * np.random.normal(size=self.action_dim)
         self.state = self.state + dx
-        action_with_noise = action + self.state
+        state_tens = torch.tensor(self.state, dtype=action.dtype, device=action.device)
+        action_with_noise = action + state_tens
         return action_with_noise
 
 def compute_td_errors(transitions):
@@ -170,12 +172,14 @@ class PolicyNetwork(nn.Module):
         self.linear1 = nn.Linear(num_inputs, hidden_size)
         self.linear2 = nn.Linear(hidden_size, hidden_size)
         self.linear3 = nn.Linear(hidden_size, num_actions)
+        self.tanh = nn.Tanh()
         self.softmax = nn.Softmax(dim=1)
         
     def forward(self, state):
         x = F.relu(self.linear1(state))
+        x = F.tanh(self.tanh(x))
         x = F.relu(self.linear2(x))
-        # x = F.tanh(self.linear3(x))
+        x = F.tanh(self.tanh(x))
         action_probs = F.softmax(self.linear3(x), dim=-1)
         return action_probs
     
@@ -190,6 +194,7 @@ class ValueNetwork(nn.Module):
         self.linear1 = nn.Linear(state_dim + action_dim, hidden_size)
         self.linear2 = nn.Linear(hidden_size, hidden_size)
         self.linear3 = nn.Linear(hidden_size, 1)
+        self.tanh = nn.Tanh()
         
     def forward(self, state, action):
         if action.dim() == 1:
@@ -199,17 +204,17 @@ class ValueNetwork(nn.Module):
             num_classes = self.linear1.in_features - state.shape[1]
             action = F.one_hot(action.long(), num_classes=num_classes).float()
             action = action.view(state.size(0), -1)  # Reshape to [batch_size, action_dim]
-        
         x = torch.cat([state, action], dim=1)
 
         x = F.relu(self.linear1(x))
+        x = F.tanh(self.tanh(x))
         x = F.relu(self.linear2(x))
         x = self.linear3(x)
         
         return x.view(-1, 1)
 
 
-def td3_update(step, batch_size, gamma=0.99, soft_tau=1e-2, noise_std=0.2, noise_clip=0.3, policy_update=2, target_update = 10, beta=0.4):
+def td3_update(step, batch_size, gamma=0.99, soft_tau=1e-2, noise_std=0.2, noise_clip=0.5, policy_update=2, target_update = 10, beta=0.4):
 
     batch, weights, indices = replay_buffer.sample(batch_size, beta)
     state, action, reward, next_state, done = batch
@@ -227,9 +232,10 @@ def td3_update(step, batch_size, gamma=0.99, soft_tau=1e-2, noise_std=0.2, noise
 
     # Calculate next actions with target policy
     next_action = target_policy_net(next_state)
-    noise = torch.normal(torch.zeros(next_action.size()), noise_std).to(device)
-    noise = torch.clamp(noise, -noise_clip, noise_clip)
-    next_action = normalized_actions._action(next_action + noise)
+    # noise = torch.normal(torch.zeros(next_action.size()), noise_std).to(device)
+    # noise = torch.clamp(noise, -noise_clip, noise_clip)
+    next_action = noise.get_action(next_action, step).float()
+    next_action = torch.clamp(next_action, 0, 1)
 
     target_q_value1 = target_value_net1(next_state, next_action).view(-1, 1)
     target_q_value2 = target_value_net2(next_state, next_action).view(-1, 1)
@@ -460,8 +466,10 @@ while time_step <= max_training_timesteps:
 
     for step in range(max_ep_len):
         action_tens = policy_net.get_action(state)
-        action_tens = noise.get_action(action_tens, step)
-        action_tens = normalized_actions._action(action_tens).float()
+        # print("action_tens: ", action_tens)
+        action_tens = noise.get_action(action_tens, step).float()
+        action_tens = torch.clamp(action_tens, 0, 1)
+        # print("action_tens post noise: ", action_tens)
         # Calculate initial TD error for priority
         with torch.no_grad():
             q_value = value_net1(state, action_tens)
@@ -490,6 +498,9 @@ while time_step <= max_training_timesteps:
             new_errors = compute_td_errors(transitions)
             replay_buffer.update_priorities(indices, new_errors)
             target_q_value, expected_q_value = td3_update(step, batch_size)
+        
+        if time_step % 100 == 0: # dynamic batch sampling
+            beta_start = min(1.0, beta_start + 0.01)
 
         q_values.append(target_q_value)
         policies.append(target_policy_net)
